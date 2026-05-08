@@ -8,8 +8,6 @@ Usage:
     python linuxflow.py --model tiny        # faster, lower quality
     python linuxflow.py --model base        # balanced
     python linuxflow.py --language auto     # auto-detect language
-    python linuxflow.py --no-save           # skip Obsidian save
-    python linuxflow.py --type              # auto-type via ydotool
     python linuxflow.py --devices           # list audio devices
 
 Daemon mode:
@@ -18,8 +16,9 @@ Daemon mode:
 """
 
 import argparse
+import configparser
 import ctypes
-import datetime
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import signal
@@ -85,14 +84,26 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
-OBSIDIAN_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "linuxflow", "transcripts")
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "linuxflow")
 PID_FILE = os.path.join(STATE_DIR, "linuxflow.pid")
+SOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 MIN_DURATION = 0.2  # seconds - allow short one-word utterances
 POST_RELEASE_BUFFER = 0.35  # seconds - capture trailing phonemes after key release
 TRANSCRIBE_TAIL_PAD = 0.25  # seconds - append silence to preserve final token
 ASR_TIMEOUT_S = 30.0
 ASR_RETRIES = 1
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "linuxflow")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LANGUAGE_OPTIONS = ["auto", "en", "es", "fr", "de", "hi"]
+MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
+HOTKEY_OPTIONS = [
+    "Ctrl+Super+Z",
+    "Ctrl+Alt+Z",
+    "Ctrl+Shift+Space",
+    "Alt+Super+Z",
+    "CapsLock",
+]
+ICON_THEME_OPTIONS = ["auto", "light", "dark"]
 
 logger = logging.getLogger("linuxflow")
 if not logger.handlers:
@@ -113,6 +124,120 @@ logger.setLevel(logging.INFO)
 def log_event(level, event, **fields):
     parts = [event] + [f"{k}={repr(v)}" for k, v in fields.items()]
     logger.log(level, " ".join(parts))
+
+
+def load_persistent_config():
+    defaults = {
+        "model": "small",
+        "language": "en",
+        "clipboard_enabled": True,
+        "paste_enabled": True,
+        "sound_notifications": False,
+        "release_tail_buffer_s": 0.55,
+        "hotkey": "Ctrl+Super+Z",
+        "icon_theme": "auto",
+    }
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                defaults.update(loaded)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log_event(logging.WARNING, "config_load_failed", error=str(e))
+
+    if defaults["model"] not in MODEL_OPTIONS:
+        defaults["model"] = "small"
+    if defaults["language"] not in LANGUAGE_OPTIONS:
+        defaults["language"] = "en"
+    if not _is_parseable_hotkey(defaults["hotkey"]):
+        defaults["hotkey"] = "Ctrl+Super+Z"
+    if defaults["icon_theme"] not in ICON_THEME_OPTIONS:
+        defaults["icon_theme"] = "auto"
+    try:
+        defaults["release_tail_buffer_s"] = float(defaults.get("release_tail_buffer_s", 0.55))
+    except (TypeError, ValueError):
+        defaults["release_tail_buffer_s"] = 0.55
+    defaults["release_tail_buffer_s"] = max(0.1, min(1.5, defaults["release_tail_buffer_s"]))
+    return defaults
+
+
+def normalize_hotkey_label(label):
+    """Convert 'ctrl+alt+x' to 'Ctrl+Alt+X' for consistent display."""
+    if not isinstance(label, str):
+        return label
+    parts = [p.strip() for p in label.split("+") if p.strip()]
+    out = []
+    for p in parts:
+        u = p.upper()
+        if u in {"CTRL", "ALT", "SHIFT", "SUPER"}:
+            out.append(u.capitalize())
+        elif u.startswith("F") and u[1:].isdigit():
+            out.append(u)
+        elif u in {"SPACE", "TAB", "ENTER", "ESC"}:
+            out.append(u.capitalize())
+        else:
+            out.append(u)
+    return "+".join(out)
+
+
+def prompt_for_hotkey(current_label):
+    """Open a native dialog to ask for a hotkey string. Returns label or None."""
+    prompt_text = (
+        "Enter hotkey combo (modifiers + key)\n"
+        "Examples: Ctrl+Super+Z, Ctrl+Alt+Space, Ctrl+Shift+F9, CapsLock\n"
+        "Modifiers: Ctrl, Alt, Shift, Super\n"
+        "Trigger: A-Z, 0-9, F1-F12, Space, Tab, Enter, Esc, CapsLock"
+    )
+    dialogs = [
+        ["kdialog", "--title", "LinuxFlow Hotkey", "--inputbox", prompt_text, current_label],
+        ["zenity", "--entry", "--title=LinuxFlow Hotkey",
+         f"--text={prompt_text}", f"--entry-text={current_label}"],
+    ]
+    for cmd in dialogs:
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120, check=False
+            )
+            if result.returncode == 0:
+                value = (result.stdout or "").strip()
+                return value or None
+            return None
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            log_event(logging.WARNING, "hotkey_prompt_failed", error=str(e))
+            continue
+    return None
+
+
+def _is_parseable_hotkey(label):
+    """Lightweight validation: trigger key, with optional modifiers."""
+    if not isinstance(label, str):
+        return False
+    parts = [p.strip().upper() for p in label.split("+") if p.strip()]
+    if len(parts) < 1:
+        return False
+    valid_modifiers = {"CTRL", "SUPER", "ALT", "SHIFT"}
+    valid_triggers = (
+        set(chr(c) for c in range(ord("A"), ord("Z") + 1))
+        | set(str(d) for d in range(0, 10))
+        | set(f"F{n}" for n in range(1, 13))
+        | {"SPACE", "TAB", "ENTER", "ESC", "CAPSLOCK", "CAPS"}
+    )
+    if parts[-1] not in valid_triggers:
+        return False
+    for mod in parts[:-1]:
+        if mod not in valid_modifiers:
+            return False
+    return True
+
+
+def save_persistent_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, sort_keys=True)
 
 
 # ---------- Core functions ----------
@@ -238,6 +363,26 @@ def paste_from_clipboard(text=None):
     return False
 
 
+def play_notification_sound(sound_path):
+    """Play one notification sound asynchronously."""
+    if not sound_path or not os.path.exists(sound_path):
+        return False
+    players = [
+        ["pw-play", sound_path],
+        ["paplay", sound_path],
+        ["aplay", "-q", sound_path],
+    ]
+    for cmd in players:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return False
+
+
 def get_recorder_command(output_path):
     """Return the best available recording command for this Linux host."""
     # Prefer parecord when available (PulseAudio/PipeWire compat layer),
@@ -279,34 +424,6 @@ def stop_recorder_process(proc):
         proc.wait(timeout=1.0)
     except Exception:
         pass
-
-
-def save_to_obsidian(text, save_dir):
-    """Append transcript to today's daily note in Obsidian vault. Returns filepath."""
-    os.makedirs(save_dir, exist_ok=True)
-
-    now = datetime.datetime.now()
-    filename = now.strftime("%Y-%m-%d") + ".md"
-    filepath = os.path.join(save_dir, filename)
-
-    time_str = now.strftime("%H:%M:%S")
-
-    if os.path.exists(filepath):
-        with open(filepath, "a") as f:
-            f.write(f"- **{time_str}** — {text}\n")
-    else:
-        content = (
-            f"---\n"
-            f"date: {now.strftime('%Y-%m-%d')}\n"
-            f"type: voice-transcripts\n"
-            f"---\n\n"
-            f"# Transcripts - {now.strftime('%B %d, %Y')}\n\n"
-            f"- **{time_str}** — {text}\n"
-        )
-        with open(filepath, "w") as f:
-            f.write(content)
-
-    return filepath
 
 
 def notify(title, body):
@@ -361,6 +478,77 @@ def make_icon(color):
     return img
 
 
+def _read_cmd_output(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5, check=False)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+    return (result.stdout or "").strip().strip("'").strip('"')
+
+
+def prefers_dark_panel():
+    """Best-effort desktop theme probe. Returns True if dark panel/theme is likely."""
+    # GNOME/libadwaita standard
+    color_scheme = _read_cmd_output(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"]).lower()
+    if "prefer-dark" in color_scheme:
+        return True
+    if "prefer-light" in color_scheme:
+        return False
+
+    # Legacy GTK theme naming convention
+    gtk_theme = _read_cmd_output(["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"]).lower()
+    if "-dark" in gtk_theme or "dark" in gtk_theme:
+        return True
+    if gtk_theme:
+        return False
+
+    # KDE fallback
+    kde_globals = os.path.join(os.path.expanduser("~"), ".config", "kdeglobals")
+    if os.path.exists(kde_globals):
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(kde_globals, encoding="utf-8")
+            scheme = cfg.get("General", "ColorScheme", fallback="").lower()
+            if "dark" in scheme:
+                return True
+            if scheme:
+                return False
+        except Exception:
+            pass
+
+    return False
+
+
+def load_tray_icons(icon_theme="auto"):
+    """
+    Load tray icons from icons/ based on desktop theme.
+    Uses light-* assets on dark panels and dark-* assets on light panels.
+    """
+    icon_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+    selected_theme = icon_theme if icon_theme in {"light", "dark"} else "auto"
+    if selected_theme == "auto":
+        variant = "light" if prefers_dark_panel() else "dark"
+    else:
+        variant = selected_theme
+    state_to_name = {"green": "idle", "red": "rec", "orange": "pro"}
+    sizes = [64, 128, 48, 512, 1024]
+    loaded = {}
+
+    for color, state in state_to_name.items():
+        chosen = None
+        for size in sizes:
+            candidate = os.path.join(icon_root, f"{variant}-{state}-{size}.png")
+            if os.path.exists(candidate):
+                try:
+                    chosen = Image.open(candidate).convert("RGBA")
+                    break
+                except Exception:
+                    continue
+        loaded[color] = chosen or make_icon(color)
+
+    return loaded, variant, selected_theme
+
+
 def daemon_mode(args):
     """Run as background daemon with system tray and global hotkey."""
     if not HAS_EVDEV:
@@ -369,12 +557,32 @@ def daemon_mode(args):
     if not HAS_TRAY:
         print("Error: pystray/Pillow not installed. Run: pip install pystray Pillow")
         sys.exit(1)
+    if os.environ.get("WAYLAND_DISPLAY") and not HAS_GLIB:
+        log_event(
+            logging.WARNING,
+            "tray_glib_missing",
+            hint="Install python-gobject/python3-gi and reinstall to improve tray menu behavior on Wayland",
+        )
 
-    lang = None if args.language == "auto" else args.language
+    persisted = load_persistent_config()
+    provided_flags = getattr(args, "_provided_flags", set())
+    if "--model" in provided_flags and args.model in MODEL_OPTIONS:
+        persisted["model"] = args.model
+    if "--language" in provided_flags and args.language in LANGUAGE_OPTIONS:
+        persisted["language"] = args.language
+    if "--hotkey" in provided_flags and args.hotkey in HOTKEY_OPTIONS:
+        persisted["hotkey"] = args.hotkey
+    if "--no-clipboard" in provided_flags:
+        persisted["clipboard_enabled"] = False
+    if "--no-paste" in provided_flags:
+        persisted["paste_enabled"] = False
+    save_persistent_config(persisted)
 
-    print(f"Loading model '{args.model}'...")
+    settings_lock = threading.Lock()
+    settings = persisted
+    print(f"Loading model '{settings['model']}'...")
     asr_backend = FasterWhisperBackend(
-        model_name=args.model,
+        model_name=settings["model"],
         device="cpu",
         compute_type="int8",
         sample_rate=SAMPLE_RATE,
@@ -393,10 +601,47 @@ def daemon_mode(args):
     for kb in keyboards:
         print(f"Keyboard: {kb.name} ({kb.path})")
 
-    # Hotkey: Ctrl+Super+Z
-    CTRL_KEYS = {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
-    SUPER_KEYS = {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}
-    TRIGGER_KEY = ecodes.KEY_Z
+    MODIFIER_KEYS = {
+        "CTRL": {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL},
+        "SUPER": {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA},
+        "ALT": {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT},
+        "SHIFT": {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT},
+    }
+    trigger_key_map = {chr(code): getattr(ecodes, f"KEY_{chr(code)}") for code in range(ord("A"), ord("Z") + 1)}
+    for digit in range(0, 10):
+        trigger_key_map[str(digit)] = getattr(ecodes, f"KEY_{digit}")
+    for fn in range(1, 13):
+        trigger_key_map[f"F{fn}"] = getattr(ecodes, f"KEY_F{fn}")
+    trigger_key_map["SPACE"] = ecodes.KEY_SPACE
+    trigger_key_map["TAB"] = ecodes.KEY_TAB
+    trigger_key_map["ENTER"] = ecodes.KEY_ENTER
+    trigger_key_map["ESC"] = ecodes.KEY_ESC
+    trigger_key_map["CAPSLOCK"] = ecodes.KEY_CAPSLOCK
+    trigger_key_map["CAPS"] = ecodes.KEY_CAPSLOCK
+
+    hotkey_state = {"label": "Ctrl+Super+Z", "required_modifiers": ["CTRL", "SUPER"], "trigger_key": ecodes.KEY_Z}
+    hotkey_lock = threading.Lock()
+
+    def apply_hotkey(label):
+        parts = [p.strip().upper() for p in label.split("+") if p.strip()]
+        if len(parts) < 1:
+            return False
+        trigger_name = parts[-1]
+        modifiers = parts[:-1]
+        for mod in modifiers:
+            if mod not in MODIFIER_KEYS:
+                return False
+        trigger_code = trigger_key_map.get(trigger_name)
+        if trigger_code is None:
+            return False
+        with hotkey_lock:
+            hotkey_state["label"] = label
+            hotkey_state["required_modifiers"] = modifiers
+            hotkey_state["trigger_key"] = trigger_code
+        return True
+
+    if not apply_hotkey(settings["hotkey"]):
+        apply_hotkey("Ctrl+Super+Z")
 
     # Shared state
     recording = False
@@ -405,16 +650,25 @@ def daemon_mode(args):
     rec_tmpfile = None
     tray = None
     session_count = 0
-    hotkey_label = "Ctrl+Super+Z"
     shutdown_event = threading.Event()
 
     # Pre-create icons to avoid GTK calls from threads
-    icon_green = make_icon("green")
-    icon_red = make_icon("red")
-    icon_orange = make_icon("orange")
-    icons = {"green": icon_green, "red": icon_red, "orange": icon_orange}
+    icons, theme_variant, icon_theme_mode = load_tray_icons(settings.get("icon_theme", "auto"))
+    tray_state = {"color": "green", "title": "Ready"}
+    log_event(
+        logging.INFO,
+        "tray_icons_loaded",
+        theme_variant=theme_variant,
+        icon_theme_mode=icon_theme_mode,
+    )
+
+    def current_hotkey_label():
+        with hotkey_lock:
+            return hotkey_state["label"]
 
     def set_tray(color, title):
+        tray_state["color"] = color
+        tray_state["title"] = title
         def _update():
             if tray:
                 tray.icon = icons[color]
@@ -425,6 +679,9 @@ def daemon_mode(args):
         elif tray:
             tray.icon = icons[color]
             tray.title = f"LinuxFlow - {title}"
+
+    def refresh_ready_tray():
+        set_tray("green", f"Ready ({current_hotkey_label()})")
 
     def start_recording():
         nonlocal recording, rec_process, rec_tmpfile
@@ -459,10 +716,14 @@ def daemon_mode(args):
                 except OSError:
                     pass
                 rec_tmpfile = None
-                set_tray("green", f"Ready ({hotkey_label})")
+                refresh_ready_tray()
                 return
 
         set_tray("red", "Recording...")
+        with settings_lock:
+            local_sound_notifications = bool(settings.get("sound_notifications"))
+        if local_sound_notifications:
+            play_notification_sound(os.path.join(SOUND_DIR, "start.wav"))
 
     def stop_recording():
         nonlocal recording, rec_process, rec_tmpfile, session_count
@@ -470,10 +731,16 @@ def daemon_mode(args):
             if not recording:
                 return
             recording = False
+        with settings_lock:
+            local_sound_notifications = bool(settings.get("sound_notifications"))
+        if local_sound_notifications:
+            play_notification_sound(os.path.join(SOUND_DIR, "stop.wav"))
 
         if rec_process:
-            # Small tail buffer helps avoid clipping final syllable/word.
-            time.sleep(POST_RELEASE_BUFFER)
+            # Hold recording a bit after key release to avoid clipping final phonemes.
+            with settings_lock:
+                tail_buffer_s = float(settings.get("release_tail_buffer_s", POST_RELEASE_BUFFER))
+            time.sleep(max(0.1, min(1.5, tail_buffer_s)))
             stop_recorder_process(rec_process)
             rec_process = None
 
@@ -481,20 +748,20 @@ def daemon_mode(args):
 
         # Read the recorded wav file
         if not rec_tmpfile:
-            set_tray("green", f"Ready ({hotkey_label})")
+            refresh_ready_tray()
             return
         try:
             import wave
             with wave.open(rec_tmpfile, "rb") as wf:
                 raw = wf.readframes(wf.getnframes())
                 if len(raw) < SAMPLE_RATE * MIN_DURATION * 2:  # 2 bytes per sample
-                    set_tray("green", f"Ready ({hotkey_label})")
+                    refresh_ready_tray()
                     return
                 audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         except Exception as e:
             print(f"  Error reading audio: {e}")
             log_event(logging.ERROR, "recording_read_failed", error=str(e))
-            set_tray("green", f"Ready ({hotkey_label})")
+            refresh_ready_tray()
             return
         finally:
             try:
@@ -504,21 +771,27 @@ def daemon_mode(args):
             rec_tmpfile = None
 
         duration = len(audio) / SAMPLE_RATE
+        with settings_lock:
+            local_clipboard_enabled = settings["clipboard_enabled"]
+            local_paste_enabled = settings["paste_enabled"]
+            local_language = settings["language"]
+        lang_local = None if local_language == "auto" else local_language
 
+        # Use the currently selected language setting.
         start = time.time()
         try:
-            transcript = asr_backend.transcribe(audio, language=lang)
+            transcript = asr_backend.transcribe(audio, language=lang_local)
             text = transcript.text
             detected_lang = transcript.language
         except Exception as e:
             print(f"  Transcription failed: {e}")
             log_event(logging.ERROR, "transcription_failed", error=str(e))
-            set_tray("green", f"Ready ({hotkey_label})")
+            refresh_ready_tray()
             return
         elapsed = time.time() - start
 
         if not text:
-            set_tray("green", f"Ready ({hotkey_label})")
+            refresh_ready_tray()
             return
 
         session_count += 1
@@ -533,23 +806,16 @@ def daemon_mode(args):
             transcribe_duration_s=round(elapsed, 2),
         )
 
-        if not args.no_clipboard:
+        if local_clipboard_enabled:
             insert_text = format_for_insert(text)
             copied = copy_to_clipboard(insert_text)
-            if copied and not args.no_paste:
+            if copied and local_paste_enabled:
                 # Give compositor/focus a brief moment before sending paste hotkey.
                 time.sleep(0.2)
                 if not paste_from_clipboard(text=insert_text):
                     print("  [paste] failed (ensure ydotoold is running)")
 
-        if args.auto_type:
-            type_text(text)
-
-        if not args.no_save:
-            saved_path = save_to_obsidian(text, args.save_dir)
-            print(f"  [obsidian] {os.path.basename(saved_path)}")
-
-        set_tray("green", f"Ready ({hotkey_label})")
+        refresh_ready_tray()
 
     def hotkey_listener():
         pressed = set()
@@ -571,10 +837,12 @@ def daemon_mode(args):
                         elif event.value == 0:  # key up
                             pressed.discard(k)
 
-                        has_ctrl = bool(pressed & CTRL_KEYS)
-                        has_super = bool(pressed & SUPER_KEYS)
-                        has_trigger = TRIGGER_KEY in pressed
-                        combo_active = has_ctrl and has_super and has_trigger
+                        with hotkey_lock:
+                            required_modifiers = list(hotkey_state["required_modifiers"])
+                            trigger_key = hotkey_state["trigger_key"]
+                        modifiers_ok = all(bool(pressed & MODIFIER_KEYS[mod]) for mod in required_modifiers)
+                        has_trigger = trigger_key in pressed
+                        combo_active = modifiers_ok and has_trigger
 
                         if combo_active and not recording:
                             start_recording()
@@ -597,6 +865,159 @@ def daemon_mode(args):
                 except Exception:
                     pass
 
+    def save_settings():
+        with settings_lock:
+            save_persistent_config(dict(settings))
+        if tray:
+            try:
+                tray.update_menu()
+            except Exception:
+                pass
+        refresh_ready_tray()
+
+    def refresh_tray_icons():
+        nonlocal icons
+        with settings_lock:
+            selected = settings.get("icon_theme", "auto")
+        icons, selected_variant, selected_mode = load_tray_icons(selected)
+        log_event(
+            logging.INFO,
+            "tray_icons_reloaded",
+            theme_variant=selected_variant,
+            icon_theme_mode=selected_mode,
+        )
+        set_tray(tray_state.get("color", "green"), tray_state.get("title", f"Ready ({current_hotkey_label()})"))
+
+    def validate_sound_assets():
+        with settings_lock:
+            enabled = bool(settings.get("sound_notifications"))
+        if not enabled:
+            return
+        missing = []
+        for name in ("start.wav", "stop.wav"):
+            if not os.path.exists(os.path.join(SOUND_DIR, name)):
+                missing.append(name)
+        if missing:
+            log_event(
+                logging.WARNING,
+                "sound_files_missing",
+                expected_dir=SOUND_DIR,
+                missing=missing,
+            )
+
+    def restart_service():
+        try:
+            subprocess.Popen(["systemctl", "--user", "restart", "linuxflow.service"])
+            return True
+        except Exception as e:
+            print(f"  Restart failed: {e}")
+            return False
+
+    def open_logs():
+        log_path = os.path.join(STATE_DIR, "linuxflow.log")
+        try:
+            subprocess.Popen(["xdg-open", log_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"  Could not open logs: {e}")
+
+    def toggle_recording(icon_ref, item):
+        with recording_lock:
+            is_recording = recording
+        if is_recording:
+            threading.Thread(target=stop_recording, daemon=True).start()
+        else:
+            start_recording()
+
+    def on_toggle_clipboard(icon_ref, item):
+        with settings_lock:
+            settings["clipboard_enabled"] = not settings["clipboard_enabled"]
+            if not settings["clipboard_enabled"]:
+                settings["paste_enabled"] = False
+        save_settings()
+
+    def on_toggle_paste(icon_ref, item):
+        with settings_lock:
+            settings["paste_enabled"] = not settings["paste_enabled"]
+            if settings["paste_enabled"]:
+                settings["clipboard_enabled"] = True
+        save_settings()
+
+    def on_toggle_sound_notifications(icon_ref, item):
+        with settings_lock:
+            settings["sound_notifications"] = not settings["sound_notifications"]
+        save_settings()
+        validate_sound_assets()
+
+    def set_model(model_name):
+        def _handler(icon_ref, item):
+            with settings_lock:
+                settings["model"] = model_name
+            save_settings()
+            restart_service()
+        return _handler
+
+    def set_language(language_name):
+        def _handler(icon_ref, item):
+            with settings_lock:
+                settings["language"] = language_name
+            save_settings()
+        return _handler
+
+    def set_hotkey(hotkey_name):
+        def _handler(icon_ref, item):
+            if not apply_hotkey(hotkey_name):
+                print(f"  Unsupported hotkey: {hotkey_name}")
+                return
+            with settings_lock:
+                settings["hotkey"] = hotkey_name
+            save_settings()
+        return _handler
+
+    def set_icon_theme(icon_theme):
+        def _handler(icon_ref, item):
+            with settings_lock:
+                settings["icon_theme"] = icon_theme
+            save_settings()
+            refresh_tray_icons()
+        return _handler
+
+    def on_set_custom_hotkey(icon_ref, item):
+        def _runner():
+            current = current_hotkey_label()
+            raw = prompt_for_hotkey(current)
+            if not raw:
+                return
+            normalized = normalize_hotkey_label(raw)
+            if not apply_hotkey(normalized):
+                try:
+                    subprocess.Popen([
+                        "notify-send",
+                        "LinuxFlow",
+                        f"Invalid hotkey: {raw}\nUse e.g. Ctrl+Alt+X",
+                    ])
+                except FileNotFoundError:
+                    pass
+                print(f"  Invalid hotkey input: {raw}")
+                return
+            with settings_lock:
+                settings["hotkey"] = normalized
+            save_settings()
+            try:
+                subprocess.Popen([
+                    "notify-send",
+                    "LinuxFlow",
+                    f"Hotkey set to {normalized}",
+                ])
+            except FileNotFoundError:
+                pass
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def on_restart(icon_ref, item):
+        restart_service()
+
+    def on_open_logs(icon_ref, item):
+        open_logs()
+
     def on_quit(icon_ref, item):
         nonlocal recording, rec_process, rec_tmpfile
         shutdown_event.set()
@@ -618,19 +1039,105 @@ def daemon_mode(args):
         nonlocal tray
         tray = icon_ref
         tray.visible = True
+        validate_sound_assets()
+        refresh_ready_tray()
         write_pid_file()
         threading.Thread(target=hotkey_listener, daemon=True).start()
         print("\nRunning in background.")
-        print(f"  Hold {hotkey_label} to record, release to stop.")
-        print("  Right-click tray icon to quit.\n")
+        print(f"  Hold {current_hotkey_label()} to record, release to stop.")
+        print("  Click tray icon for menu (left-click on some desktops), then choose Quit.\n")
+
+    def is_recording_checked(item):
+        with recording_lock:
+            return recording
+
+    def checked_setting(key):
+        def _checked(item):
+            with settings_lock:
+                return bool(settings.get(key))
+        return _checked
+
+    def checked_model(model_name):
+        def _checked(item):
+            with settings_lock:
+                return settings["model"] == model_name
+        return _checked
+
+    def checked_language(language_name):
+        def _checked(item):
+            with settings_lock:
+                return settings["language"] == language_name
+        return _checked
+
+    def checked_hotkey(hotkey_name):
+        def _checked(item):
+            with settings_lock:
+                return settings["hotkey"] == hotkey_name
+        return _checked
+
+    def checked_icon_theme(icon_theme):
+        def _checked(item):
+            with settings_lock:
+                return settings.get("icon_theme", "auto") == icon_theme
+        return _checked
 
     tray_icon = pystray.Icon(
         "linuxflow",
-        icon=make_icon("green"),
-        title=f"LinuxFlow - Ready ({hotkey_label})",
+        icon=icons["green"],
+        title=f"LinuxFlow - Ready ({current_hotkey_label()})",
         menu=pystray.Menu(
             pystray.MenuItem("LinuxFlow", None, enabled=False),
-            pystray.MenuItem(f"Model: {args.model}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Start / Stop Recording", toggle_recording, checked=is_recording_checked, default=True),
+            pystray.MenuItem("Restart Service", on_restart),
+            pystray.MenuItem("Open Logs", on_open_logs),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Copy to Clipboard", on_toggle_clipboard, checked=checked_setting("clipboard_enabled")),
+            pystray.MenuItem("Auto Paste", on_toggle_paste, checked=checked_setting("paste_enabled")),
+            pystray.MenuItem("Sound Notifications", on_toggle_sound_notifications, checked=checked_setting("sound_notifications")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Model",
+                pystray.Menu(*[
+                    pystray.MenuItem(model_name, set_model(model_name), checked=checked_model(model_name), radio=True)
+                    for model_name in MODEL_OPTIONS
+                ]),
+            ),
+            pystray.MenuItem(
+                "Language",
+                pystray.Menu(*[
+                    pystray.MenuItem(language_name, set_language(language_name), checked=checked_language(language_name), radio=True)
+                    for language_name in LANGUAGE_OPTIONS
+                ]),
+            ),
+            pystray.MenuItem(
+                "Hotkey",
+                pystray.Menu(
+                    *[
+                        pystray.MenuItem(
+                            hotkey_name,
+                            set_hotkey(hotkey_name),
+                            checked=checked_hotkey(hotkey_name),
+                            radio=True,
+                        )
+                        for hotkey_name in HOTKEY_OPTIONS
+                    ],
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Set Custom Hotkey...", on_set_custom_hotkey),
+                ),
+            ),
+            pystray.MenuItem(
+                "Icon Theme",
+                pystray.Menu(*[
+                    pystray.MenuItem(
+                        theme_name.capitalize(),
+                        set_icon_theme(theme_name),
+                        checked=checked_icon_theme(theme_name),
+                        radio=True,
+                    )
+                    for theme_name in ICON_THEME_OPTIONS
+                ]),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ),
@@ -718,16 +1225,6 @@ def terminal_mode(args):
                         else:
                             print("  [paste] failed (ensure ydotoold is running)")
 
-            if args.auto_type:
-                if type_text(text):
-                    print("  [ydotool] typed")
-                else:
-                    print("  [ydotool] not available -- install package: ydotool")
-
-            if not args.no_save:
-                path = save_to_obsidian(text, args.save_dir)
-                print(f"  [obsidian] {os.path.basename(path)}")
-
             print()
 
     except KeyboardInterrupt:
@@ -746,17 +1243,24 @@ def main():
         "--language", default="en",
         help="Language code (default: en). Use 'auto' for auto-detection"
     )
-    parser.add_argument("--save-dir", default=OBSIDIAN_DIR, help="Directory to save transcripts")
-    parser.add_argument("--no-save", action="store_true", help="Don't save to Obsidian")
+    parser.add_argument(
+        "--hotkey", default="Ctrl+Super+Z",
+        choices=HOTKEY_OPTIONS,
+        help="Daemon hotkey combo (default: Ctrl+Super+Z)"
+    )
     parser.add_argument("--no-clipboard", action="store_true", help="Don't copy to clipboard")
     parser.add_argument("--no-paste", action="store_true", help="Don't auto-paste after copying to clipboard")
-    parser.add_argument("--type", dest="auto_type", action="store_true", help="Auto-type via ydotool")
     parser.add_argument("--device", type=int, default=None, help="Audio input device index")
     parser.add_argument("--devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("--daemon", action="store_true", help="Run as background daemon with tray icon + hotkey")
     parser.add_argument("--asr-timeout", type=float, default=ASR_TIMEOUT_S, help="ASR request timeout in seconds")
     parser.add_argument("--asr-retries", type=int, default=ASR_RETRIES, help="Number of ASR retries after failure")
     args = parser.parse_args()
+    args._provided_flags = {
+        token.split("=")[0]
+        for token in sys.argv[1:]
+        if token.startswith("--")
+    }
 
     if args.devices:
         list_devices()

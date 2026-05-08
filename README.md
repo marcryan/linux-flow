@@ -7,17 +7,22 @@ Free, offline, open-source alternative to [WisprFlow](https://wisprflow.ai) for 
 ## Quick Start (One Command)
 
 ```bash
-sudo pacman -S --needed python python-pip python-virtualenv portaudio ydotool libappindicator-gtk3 pulseaudio wl-clipboard && \
-python -m venv venv && source venv/bin/activate && \
-pip install -r requirements.txt && \
-sudo usermod -aG input $USER && \
-echo "Log out and back in, then run: ./start.sh"
+git clone https://github.com/amitdevv/linux-flow.git
+cd linux-flow
+./install.sh
 ```
+
+Installer actions:
+- installs distro dependencies (`apt`, `dnf`, `pacman`)
+- creates `~/.local/share/linuxflow` with an isolated venv
+- installs user service: `~/.config/systemd/user/linuxflow.service`
+- installs launcher: `~/.local/share/applications/linuxflow.desktop`
+- configures `/dev/input` access via `udev` `uaccess` rule
 
 ## How It Works
 
 ```
-Hold Ctrl+Super+Z → mic records → release → faster-whisper transcribes → clipboard + auto-paste + Obsidian
+Hold Ctrl+Super+Z → mic records → release → faster-whisper transcribes → clipboard + auto-paste
 ```
 
 Two modes:
@@ -31,9 +36,10 @@ Two modes:
 
 - **100% offline** - all processing happens locally, no internet needed
 - **Global hotkey** - `Ctrl+Super+Z` works from any app (browser, editor, chat, etc.)
-- **System tray icon** - green = ready, red = recording, orange = transcribing
-- **Obsidian integration** - daily notes with timestamped bullet points
+- **System tray icon** - theme-aware light/dark assets (idle/recording/transcribing)
+- **Tray settings menu** - right-click tray icon to change model, language, hotkey, and behavior toggles
 - **Clipboard + auto-paste** - transcription is copied and then pasted into the focused app
+- **Optional hotkey sounds** - play custom start/stop sounds on key press/release
 - **Wayland + X11** - works on both via evdev + parecord
 - **100+ languages** - auto-detection or specify with `--language`
 - **Multiple models** - trade speed for accuracy based on your hardware
@@ -63,29 +69,17 @@ Models download automatically on first run. The `small` model (~500MB download) 
 - PipeWire or PulseAudio (default on modern distros)
 - A microphone
 
-### Step 1: System packages
+### Step 1: Run installer
 
-**Fedora:**
 ```bash
-sudo dnf install ydotool libayatana-appindicator-gtk3 gnome-shell-extension-appindicator portaudio-devel
+./install.sh
 ```
 
-**Ubuntu/Debian:**
-```bash
-sudo apt install ydotool libayatana-appindicator3-1 gnome-shell-extension-appindicator portaudio19-dev pulseaudio-utils
-```
-
-**Arch:**
-```bash
-sudo pacman -S ydotool libappindicator-gtk3 portaudio pulseaudio wl-clipboard
-```
-
-### Step 2: Python packages (isolated venv, no system breakage)
+### Step 2: Verify service
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+systemctl --user status linuxflow.service
+journalctl --user -u linuxflow -f
 ```
 
 Current `requirements.txt`:
@@ -99,21 +93,10 @@ pystray>=0.19.0
 Pillow>=10.0.0
 ```
 
-### Step 3: Permissions
+### Step 3: Run
 
 ```bash
-# Required for global hotkey detection (reads keyboard via /dev/input)
-sudo usermod -aG input $USER
-
-# IMPORTANT: Log out and log back in for this to take effect
-```
-
-### Step 4: Run
-
-```bash
-git clone https://github.com/amitdevv/linux-flow.git
-cd linux-flow
-./start.sh
+systemctl --user restart linuxflow.service
 ```
 
 ## Usage
@@ -126,7 +109,6 @@ python linuxflow.py --daemon --model tiny       # faster, less accurate
 python linuxflow.py --daemon --model medium     # slower, more accurate
 python linuxflow.py --daemon --language auto    # auto-detect language
 python linuxflow.py --daemon --language hi      # Hindi
-python linuxflow.py --daemon --no-save          # don't save to Obsidian
 python linuxflow.py --daemon --no-clipboard     # don't copy to clipboard
 python linuxflow.py --daemon --no-paste         # don't auto-paste after copy
 ```
@@ -138,6 +120,18 @@ If you installed into `venv`, run with:
 ```
 
 Then from any app: **hold `Ctrl+Super+Z`**, speak, **release**.
+
+Click the tray icon to manage (on some desktops, this is left-click instead of right-click):
+- start/stop recording, restart/stop service, open logs, quit
+- clipboard/paste/sound notification toggles
+- model, language, and hotkey (persisted in `~/.config/linuxflow/config.json`)
+- force tray icon theme with `icon_theme` in `~/.config/linuxflow/config.json`: `auto`, `light`, or `dark`
+- sound files (when enabled): `sounds/start.wav` and `sounds/stop.wav`
+- release tail capture is configurable via `release_tail_buffer_s` in `~/.config/linuxflow/config.json` (default `0.55`)
+- `Hotkey -> Set Custom Hotkey...` opens a dialog (kdialog/zenity) to type any combo
+  - Modifiers: `Ctrl`, `Alt`, `Shift`, `Super`
+  - Triggers: `A-Z`, `0-9`, `F1-F12`, `Space`, `Tab`, `Enter`, `Esc`, `CapsLock`
+  - Examples: `Ctrl+Alt+X`, `Ctrl+Super+F9`, `Ctrl+Shift+Space`, `CapsLock`
 
 ### Terminal Mode
 
@@ -155,11 +149,8 @@ Press `Enter` to start recording, `Enter` again to stop.
 | `--daemon` | Run as background daemon with tray icon + hotkey |
 | `--model MODEL` | ASR model profile: `tiny`, `base`, `small` (default), `medium`, `large-v3-turbo` |
 | `--language LANG` | Language code (`en`, `hi`, `es`, etc.) or `auto` for detection |
-| `--save-dir PATH` | Where to save transcripts (default: Obsidian vault) |
-| `--no-save` | Don't save transcripts to disk |
 | `--no-clipboard` | Don't copy to clipboard |
 | `--no-paste` | Don't auto-paste after copying to clipboard |
-| `--type` | Auto-type text into focused app via ydotool |
 | `--device N` | Use specific audio input device (see `--devices`) |
 | `--devices` | List available audio input devices |
 | `--asr-timeout S` | ASR timeout in seconds (default: `30`) |
@@ -167,28 +158,9 @@ Press `Enter` to start recording, `Enter` again to stop.
 
 ## Auto-Start on Login (systemd)
 
+`install.sh` enables this automatically:
+
 ```bash
-mkdir -p ~/.config/systemd/user
-
-cat > ~/.config/systemd/user/linuxflow.service << 'EOF'
-[Unit]
-Description=LinuxFlow - Voice Dictation
-After=graphical-session.target pipewire.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sg input -c "/path/to/linux-flow/venv/bin/python /path/to/linux-flow/linuxflow.py --daemon --model small"
-WorkingDirectory=/path/to/linux-flow
-Restart=on-failure
-RestartSec=3
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-
-# Edit the paths above, then:
-systemctl --user daemon-reload
 systemctl --user enable --now linuxflow.service
 ```
 
@@ -210,26 +182,11 @@ systemctl --user restart linuxflow.service        # reload after code/config cha
 systemctl --user stop linuxflow.service           # stop service
 ```
 
-## Obsidian Integration
+## Uninstall
 
-Transcriptions are saved as daily notes (configurable with `--save-dir`).
-
-Each day gets one file (`2026-03-20.md`) with bullet points:
-
-```markdown
----
-date: 2026-03-20
-type: voice-transcripts
----
-
-# Transcripts - March 20, 2026
-
-- **15:45:46** - Hi, hello hello
-- **15:45:57** - What are you guys doing currently today?
-- **16:10:30** - I need to finish the API integration by tomorrow
+```bash
+./uninstall.sh
 ```
-
-Works whether Obsidian is open or not - it's just markdown files.
 
 ## Architecture
 
@@ -238,11 +195,6 @@ Works whether Obsidian is open or not - it's just markdown files.
 │ evdev        │────>│ parecord │────>│ faster-whisper │────>│ wl-copy  │
 │ (hotkey)     │     │ (mic)    │     │ (STT)          │     │ (clipboard)│
 └─────────────┘     └──────────┘     └───────────────┘     └──────────┘
-                                            │
-                                            ▼
-                                     ┌──────────────┐
-                                     │ Obsidian .md  │
-                                     └──────────────┘
 ```
 
 | Component | Tool | Why |
@@ -276,6 +228,12 @@ sudo dnf install gnome-shell-extension-appindicator
 # Then enable "AppIndicator and KStatusNotifierItem Support" in GNOME Extensions app
 ```
 
+**Tray icon/menu missing on Arch/CachyOS** - Install an AppIndicator library, then restart LinuxFlow:
+```bash
+sudo pacman -S --needed libayatana-appindicator
+systemctl --user restart linuxflow.service
+```
+
 **ALSA/GTK warnings in logs** - Cosmetic and harmless. They don't affect functionality.
 
 **Where logs are written** - Runtime logs are written to `~/.local/state/linuxflow/linuxflow.log` (rotated, with backups).
@@ -296,7 +254,6 @@ sudo systemctl enable --now ydotool.service
 ## Future Plans
 
 - [ ] LLM text cleanup via Ollama (remove filler words, fix grammar - "Flow mode")
-- [ ] Auto-type into focused app (ydotool integration)
 - [ ] Custom hotkey configuration
 - [ ] Per-app tone adjustment
 
