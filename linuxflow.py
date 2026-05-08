@@ -18,6 +18,7 @@ Daemon mode:
 import argparse
 import configparser
 import ctypes
+from datetime import datetime
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -56,28 +57,36 @@ try:
 except (ImportError, ValueError):
     HAS_GLIB = False
 
-# Suppress noisy ALSA warnings on PipeWire systems
-try:
-    _asound = ctypes.cdll.LoadLibrary("libasound.so.2")
-    _err_handler = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
-                                     ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)(
-        lambda *_: None
-    )
-    _asound.snd_lib_error_set_handler(_err_handler)
-except OSError:
-    pass
+SUPPRESS_NATIVE_WARNINGS = os.environ.get("LINUXFLOW_SUPPRESS_ALSA_GTK_WARNINGS", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
-# Suppress GTK-CRITICAL warnings (cosmetic, from pystray on Wayland)
-try:
-    _gtk = ctypes.cdll.LoadLibrary("libgtk-3.so.0")
-    _log_handler = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
-                                     ctypes.c_char_p, ctypes.c_void_p)(
-        lambda *_: None
-    )
-    _glib = ctypes.cdll.LoadLibrary("libglib-2.0.so.0")
-    _glib.g_log_set_handler(b"Gtk", 1 << 4, _log_handler, None)  # G_LOG_LEVEL_CRITICAL
-except OSError:
-    pass
+# Suppress noisy ALSA warnings on PipeWire systems (can be disabled via env var).
+if SUPPRESS_NATIVE_WARNINGS:
+    try:
+        _asound = ctypes.cdll.LoadLibrary("libasound.so.2")
+        _err_handler = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                         ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)(
+            lambda *_: None
+        )
+        _asound.snd_lib_error_set_handler(_err_handler)
+    except OSError:
+        pass
+
+# Suppress GTK-CRITICAL warnings (cosmetic, from pystray on Wayland).
+if SUPPRESS_NATIVE_WARNINGS:
+    try:
+        _gtk = ctypes.cdll.LoadLibrary("libgtk-3.so.0")
+        _log_handler = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                         ctypes.c_char_p, ctypes.c_void_p)(
+            lambda *_: None
+        )
+        _glib = ctypes.cdll.LoadLibrary("libglib-2.0.so.0")
+        _glib.g_log_set_handler(b"Gtk", 1 << 4, _log_handler, None)  # G_LOG_LEVEL_CRITICAL
+    except OSError:
+        pass
 
 # ---------- Config ----------
 SAMPLE_RATE = 16000
@@ -104,6 +113,17 @@ HOTKEY_OPTIONS = [
     "CapsLock",
 ]
 ICON_THEME_OPTIONS = ["auto", "light", "dark"]
+CONFIG_SCHEMA = {
+    "model": {"default": "small", "type": str, "allowed": MODEL_OPTIONS},
+    "language": {"default": "en", "type": str, "allowed": LANGUAGE_OPTIONS},
+    "clipboard_enabled": {"default": True, "type": bool},
+    "paste_enabled": {"default": True, "type": bool},
+    "sound_notifications": {"default": False, "type": bool},
+    "append_space": {"default": True, "type": bool},
+    "release_tail_buffer_s": {"default": 0.55, "type": float, "min": 0.1, "max": 1.5},
+    "hotkey": {"default": "Ctrl+Super+Z", "type": str, "validator": "hotkey"},
+    "icon_theme": {"default": "auto", "type": str, "allowed": ICON_THEME_OPTIONS},
+}
 
 logger = logging.getLogger("linuxflow")
 if not logger.handlers:
@@ -126,40 +146,110 @@ def log_event(level, event, **fields):
     logger.log(level, " ".join(parts))
 
 
+def _backup_broken_config_file():
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_base = f"{CONFIG_FILE}.bad-{ts}"
+    backup_path = backup_base
+    suffix = 1
+    while os.path.exists(backup_path):
+        backup_path = f"{backup_base}-{suffix}"
+        suffix += 1
+    os.replace(CONFIG_FILE, backup_path)
+    return backup_path
+
+
+def _atomic_write_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, path)
+    dir_fd = os.open(os.path.dirname(path), os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _default_persistent_config():
+    return {key: meta["default"] for key, meta in CONFIG_SCHEMA.items()}
+
+
+def _validate_config_field(key, value):
+    schema = CONFIG_SCHEMA[key]
+    expected_type = schema["type"]
+
+    if expected_type is bool:
+        if not isinstance(value, bool):
+            return False, f"bool:{key}", schema["default"]
+        return True, None, value
+
+    if expected_type is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False, f"number:{key}", schema["default"]
+        normalized = float(value)
+        min_value = schema.get("min")
+        max_value = schema.get("max")
+        if min_value is not None and normalized < min_value:
+            return False, f"number in range [{min_value}, {max_value}]", schema["default"]
+        if max_value is not None and normalized > max_value:
+            return False, f"number in range [{min_value}, {max_value}]", schema["default"]
+        return True, None, normalized
+
+    if not isinstance(value, expected_type):
+        return False, expected_type.__name__, schema["default"]
+
+    allowed = schema.get("allowed")
+    if allowed is not None and value not in allowed:
+        return False, f"one_of:{allowed}", schema["default"]
+
+    if schema.get("validator") == "hotkey":
+        normalized = normalize_hotkey_label(value)
+        if not _is_parseable_hotkey(normalized):
+            return False, "parseable hotkey", schema["default"]
+        return True, None, normalized
+
+    return True, None, value
+
+
 def load_persistent_config():
-    defaults = {
-        "model": "small",
-        "language": "en",
-        "clipboard_enabled": True,
-        "paste_enabled": True,
-        "sound_notifications": False,
-        "release_tail_buffer_s": 0.55,
-        "hotkey": "Ctrl+Super+Z",
-        "icon_theme": "auto",
-    }
+    defaults = _default_persistent_config()
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
             loaded = json.load(fh)
             if isinstance(loaded, dict):
-                defaults.update(loaded)
+                for key, value in loaded.items():
+                    if key not in CONFIG_SCHEMA:
+                        log_event(logging.WARNING, "config_unknown_key_ignored", key=key)
+                        continue
+                    is_valid, expected, normalized = _validate_config_field(key, value)
+                    if not is_valid:
+                        log_event(
+                            logging.WARNING,
+                            "config_field_invalid",
+                            key=key,
+                            value=value,
+                            expected=expected,
+                            action="defaulted",
+                        )
+                        continue
+                    defaults[key] = normalized
     except FileNotFoundError:
         pass
     except Exception as e:
         log_event(logging.WARNING, "config_load_failed", error=str(e))
-
-    if defaults["model"] not in MODEL_OPTIONS:
-        defaults["model"] = "small"
-    if defaults["language"] not in LANGUAGE_OPTIONS:
-        defaults["language"] = "en"
-    if not _is_parseable_hotkey(defaults["hotkey"]):
-        defaults["hotkey"] = "Ctrl+Super+Z"
-    if defaults["icon_theme"] not in ICON_THEME_OPTIONS:
-        defaults["icon_theme"] = "auto"
-    try:
-        defaults["release_tail_buffer_s"] = float(defaults.get("release_tail_buffer_s", 0.55))
-    except (TypeError, ValueError):
-        defaults["release_tail_buffer_s"] = 0.55
-    defaults["release_tail_buffer_s"] = max(0.1, min(1.5, defaults["release_tail_buffer_s"]))
+        try:
+            backup_path = _backup_broken_config_file()
+            log_event(logging.WARNING, "config_backed_up_as_bad", backup_path=backup_path)
+        except Exception as backup_err:
+            log_event(
+                logging.WARNING,
+                "config_backup_failed",
+                error=str(backup_err),
+                source=CONFIG_FILE,
+            )
     return defaults
 
 
@@ -235,9 +325,7 @@ def _is_parseable_hotkey(label):
 
 
 def save_persistent_config(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2, sort_keys=True)
+    _atomic_write_json(CONFIG_FILE, cfg)
 
 
 def _prompt_choice(options_count, allow_back=False):
@@ -479,9 +567,12 @@ def record_audio(device_index=None):
     return audio
 
 
-def format_for_insert(text):
+def format_for_insert(text, append_space=True):
     """Prepare transcript text for clipboard/paste insertion."""
-    return text.rstrip() + " "
+    cleaned = text.rstrip()
+    if append_space:
+        return cleaned + " "
+    return cleaned
 
 
 def copy_to_clipboard(text):
@@ -631,10 +722,20 @@ def find_keyboards():
     """Find all keyboard input devices."""
     keyboards = []
     for path in evdev.list_devices():
-        dev = InputDevice(path)
-        caps = dev.capabilities().get(ecodes.EV_KEY, [])
-        if ecodes.KEY_A in caps and ecodes.KEY_SPACE in caps:
-            keyboards.append(dev)
+        dev = None
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities().get(ecodes.EV_KEY, [])
+            if ecodes.KEY_A in caps and ecodes.KEY_SPACE in caps:
+                keyboards.append(dev)
+            else:
+                dev.close()
+        except Exception:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
     return keyboards
 
 
@@ -947,6 +1048,7 @@ def daemon_mode(args):
         with settings_lock:
             local_clipboard_enabled = settings["clipboard_enabled"]
             local_paste_enabled = settings["paste_enabled"]
+            local_append_space = bool(settings.get("append_space", True))
             local_language = settings["language"]
         lang_local = None if local_language == "auto" else local_language
 
@@ -969,7 +1071,8 @@ def daemon_mode(args):
 
         session_count += 1
         print(f"  [{session_count}] ({detected_lang}, {duration:.1f}s audio, {elapsed:.1f}s transcribe)")
-        print(f"  >>> {text}")
+        if args.debug_transcript:
+            print(f"  >>> {text}")
         log_event(
             logging.INFO,
             "transcription_succeeded",
@@ -980,7 +1083,7 @@ def daemon_mode(args):
         )
 
         if local_clipboard_enabled:
-            insert_text = format_for_insert(text)
+            insert_text = format_for_insert(text, append_space=local_append_space)
             copied = copy_to_clipboard(insert_text)
             if copied and local_paste_enabled:
                 # Give compositor/focus a brief moment before sending paste hotkey.
@@ -1078,19 +1181,6 @@ def daemon_mode(args):
                 missing=missing,
             )
 
-    def restart_service():
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "restart", "linuxflow.service"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            print(f"  Restart failed: {e}")
-            return False
-
     def open_logs():
         log_path = os.path.join(STATE_DIR, "linuxflow.log")
         try:
@@ -1131,7 +1221,7 @@ def daemon_mode(args):
             with settings_lock:
                 settings["model"] = model_name
             save_settings()
-            if restart_service():
+            if restart_linuxflow_service():
                 notify("LinuxFlow", f"Model changed to {model_name}. Service restarted.")
             else:
                 notify("LinuxFlow", "Model changed, but service restart failed.")
@@ -1194,7 +1284,7 @@ def daemon_mode(args):
         threading.Thread(target=_runner, daemon=True).start()
 
     def on_restart(icon_ref, item):
-        restart_service()
+        restart_linuxflow_service()
 
     def on_open_logs(icon_ref, item):
         open_logs()
@@ -1213,6 +1303,10 @@ def daemon_mode(args):
             except OSError:
                 pass
             rec_tmpfile = None
+        try:
+            asr_backend.close()
+        except Exception as e:
+            log_event(logging.WARNING, "asr_close_failed", error=str(e))
         remove_pid_file()
         icon_ref.stop()
 
@@ -1327,6 +1421,10 @@ def daemon_mode(args):
     try:
         tray_icon.run(setup=setup)
     finally:
+        try:
+            asr_backend.close()
+        except Exception as e:
+            log_event(logging.WARNING, "asr_close_failed", error=str(e))
         remove_pid_file()
 
 
@@ -1410,6 +1508,11 @@ def terminal_mode(args):
 
     except KeyboardInterrupt:
         print(f"\n\nDone. {session_count} transcriptions this session.")
+    finally:
+        try:
+            asr_backend.close()
+        except Exception as e:
+            log_event(logging.WARNING, "asr_close_failed", error=str(e))
 
 
 # ---------- Main ----------
@@ -1431,12 +1534,17 @@ def main():
     )
     parser.add_argument("--no-clipboard", action="store_true", help="Don't copy to clipboard")
     parser.add_argument("--no-paste", action="store_true", help="Don't auto-paste after copying to clipboard")
-    parser.add_argument("--device", type=int, default=None, help="Audio input device index")
+    parser.add_argument("--device", type=int, default=None, help="Audio input device index (terminal mode only)")
     parser.add_argument("--devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("--config", action="store_true", help="Open interactive configuration menu and exit")
     parser.add_argument("--daemon", action="store_true", help="Run as background daemon with tray icon + hotkey")
     parser.add_argument("--asr-timeout", type=float, default=ASR_TIMEOUT_S, help="ASR request timeout in seconds")
     parser.add_argument("--asr-retries", type=int, default=ASR_RETRIES, help="Number of ASR retries after failure")
+    parser.add_argument(
+        "--debug-transcript",
+        action="store_true",
+        help="Daemon mode only: print transcript text to stdout/stderr for debugging (may expose dictated text in journal logs)",
+    )
     args = parser.parse_args()
     args._provided_flags = {
         token.split("=")[0]
@@ -1453,6 +1561,8 @@ def main():
         sys.exit(0)
 
     if args.daemon:
+        if args.device is not None:
+            parser.error("--device is not supported in --daemon mode; use terminal mode or remove --device.")
         daemon_mode(args)
     else:
         terminal_mode(args)

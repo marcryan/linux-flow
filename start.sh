@@ -24,7 +24,8 @@ if can_read_input_devices; then
 fi
 
 if command -v sg >/dev/null 2>&1 && id -nG "$USER" | tr ' ' '\n' | grep -qx "input"; then
-  exec sg input -c "$PYTHON_BIN linuxflow.py --daemon"
+  SG_CMD="$(printf '%q ' "$PYTHON_BIN" linuxflow.py --daemon)"
+  exec sg input -c "$SG_CMD"
 fi
 
 echo "LinuxFlow cannot read /dev/input devices."

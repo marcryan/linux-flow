@@ -29,7 +29,7 @@ run_sudo() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
   else
-    echo "sudo is required to install system dependencies and udev rules." >&2
+    echo "sudo is required to install system dependencies, manage input group membership, and remove legacy udev rules." >&2
     exit 1
   fi
 }
@@ -176,12 +176,27 @@ setup_python_env() {
   "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"
 }
 
-install_udev_rule() {
-  run_sudo tee "$UDEV_RULE_PATH" >/dev/null <<'EOF'
-KERNEL=="event*", SUBSYSTEM=="input", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
-EOF
-  run_sudo udevadm control --reload-rules
-  run_sudo udevadm trigger --subsystem-match=input
+cleanup_legacy_udev_rule() {
+  if [[ -f "$UDEV_RULE_PATH" ]]; then
+    echo "Removing legacy LinuxFlow udev rule (keyboard access now uses the input group)."
+    run_sudo rm -f "$UDEV_RULE_PATH"
+    run_sudo udevadm control --reload-rules
+    run_sudo udevadm trigger --subsystem-match=input
+  fi
+}
+
+ensure_input_group() {
+  if ! getent group input >/dev/null 2>&1; then
+    echo "ERROR: system group 'input' not found. Cannot configure keyboard device access." >&2
+    exit 1
+  fi
+  if id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+    INPUT_GROUP_JUST_ADDED=0
+    return 0
+  fi
+  run_sudo usermod -aG input "$USER"
+  echo "Added ${USER} to 'input' group. Log out and back in for hotkeys to work without the sg input fallback."
+  INPUT_GROUP_JUST_ADDED=1
 }
 
 install_user_service() {
@@ -198,6 +213,16 @@ ExecStart=${RUNNER_PATH}
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
+Environment=HF_HOME=%h/.local/state/linuxflow/hf-cache
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=%h/.config/linuxflow %h/.local/state/linuxflow
+MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=graphical-session.target
@@ -247,11 +272,13 @@ EOF
 }
 
 main() {
+  INPUT_GROUP_JUST_ADDED=0
   echo "Installing LinuxFlow..."
   install_system_dependencies
   sync_app_files
   setup_python_env
-  install_udev_rule
+  cleanup_legacy_udev_rule
+  ensure_input_group
   install_user_service
   install_desktop_entry
 
@@ -260,7 +287,9 @@ main() {
   echo "Service status: systemctl --user status linuxflow.service"
   echo "Live logs:       journalctl --user -u linuxflow -f"
   echo
-  echo "If hotkeys do not work immediately, log out and log back in once."
+  if [[ "${INPUT_GROUP_JUST_ADDED}" -eq 1 ]]; then
+    echo "If hotkeys do not work immediately, log out and log back in once."
+  fi
 }
 
 main "$@"

@@ -35,3 +35,4 @@ if [[ -f "$UDEV_RULE_PATH" ]]; then
 fi
 
 echo "LinuxFlow uninstalled."
+echo "Note: your user may still be in the 'input' group. To remove: sudo gpasswd -d \"${USER}\" input (re-login to take effect)."
