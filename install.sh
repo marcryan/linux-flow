@@ -215,14 +215,12 @@ RestartSec=2
 Environment=PYTHONUNBUFFERED=1
 Environment=HF_HOME=%h/.local/state/linuxflow/hf-cache
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 ReadWritePaths=%h/.config/linuxflow %h/.local/state/linuxflow
-MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=graphical-session.target
