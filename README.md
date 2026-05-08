@@ -105,6 +105,7 @@ systemctl --user restart linuxflow.service
 
 ```bash
 python linuxflow.py --daemon                    # default (small model)
+python linuxflow.py --config                    # interactive settings menu
 python linuxflow.py --daemon --model tiny       # faster, less accurate
 python linuxflow.py --daemon --model medium     # slower, more accurate
 python linuxflow.py --daemon --language auto    # auto-detect language
@@ -122,7 +123,7 @@ If you installed into `venv`, run with:
 Then from any app: **hold `Ctrl+Super+Z`**, speak, **release**.
 
 Click the tray icon to manage (on some desktops, this is left-click instead of right-click):
-- start/stop recording, restart/stop service, open logs, quit
+- start/stop recording, restart service, open logs, quit
 - clipboard/paste/sound notification toggles
 - model, language, and hotkey (persisted in `~/.config/linuxflow/config.json`)
 - force tray icon theme with `icon_theme` in `~/.config/linuxflow/config.json`: `auto`, `light`, or `dark`
@@ -142,6 +143,15 @@ python linuxflow.py --model tiny                # use tiny model
 
 Press `Enter` to start recording, `Enter` again to stop.
 
+### Terminal Config Menu
+
+Use `python linuxflow.py --config` for a numbered settings menu in terminal. It supports:
+- model, language, hotkey (including `CapsLock`)
+- copy to clipboard, auto paste, sound notifications
+- `Exit Config`
+
+When a change requires daemon reload (for example model/hotkey/language), the menu prompts to restart `linuxflow.service` immediately.
+
 ### All Options
 
 | Flag | Description |
@@ -151,6 +161,7 @@ Press `Enter` to start recording, `Enter` again to stop.
 | `--language LANG` | Language code (`en`, `hi`, `es`, etc.) or `auto` for detection |
 | `--no-clipboard` | Don't copy to clipboard |
 | `--no-paste` | Don't auto-paste after copying to clipboard |
+| `--config` | Open interactive terminal menu to configure tray settings |
 | `--device N` | Use specific audio input device (see `--devices`) |
 | `--devices` | List available audio input devices |
 | `--asr-timeout S` | ASR timeout in seconds (default: `30`) |

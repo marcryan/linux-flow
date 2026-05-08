@@ -240,6 +240,179 @@ def save_persistent_config(cfg):
         json.dump(cfg, fh, indent=2, sort_keys=True)
 
 
+def _prompt_choice(options_count, allow_back=False):
+    while True:
+        raw = input("> ").strip()
+        if allow_back and raw.lower() in {"b", "back"}:
+            return None
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= options_count:
+                return idx - 1
+        print("Invalid selection. Enter a valid number.")
+
+
+def _prompt_yes_no(message):
+    while True:
+        raw = input(f"{message} [y/N]: ").strip().lower()
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"", "n", "no"}:
+            return False
+        print("Please enter y or n.")
+
+
+def restart_linuxflow_service():
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "linuxflow.service"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def configure_settings_menu():
+    """Interactive terminal settings menu for tray-equivalent options."""
+    cfg = load_persistent_config()
+
+    def _print_header():
+        print("\n=== LinuxFlow Configuration ===")
+        print(f"1) Model               [{cfg['model']}]")
+        print(f"2) Language            [{cfg['language']}]")
+        print(f"3) Hotkey              [{cfg['hotkey']}]")
+        print(f"4) Copy to Clipboard   [{'ON' if cfg['clipboard_enabled'] else 'OFF'}]")
+        print(f"5) Auto Paste          [{'ON' if cfg['paste_enabled'] else 'OFF'}]")
+        print(f"6) Sound Notifications [{'ON' if cfg.get('sound_notifications', False) else 'OFF'}]")
+        print("7) Exit Config")
+        print("Choose an item number:")
+
+    while True:
+        _print_header()
+        choice = _prompt_choice(7)
+        requires_restart = False
+
+        if choice == 0:
+            print("\nModel options:")
+            for i, model in enumerate(MODEL_OPTIONS, 1):
+                print(f"{i}) {model}")
+            print("Select model number:")
+            selected = _prompt_choice(len(MODEL_OPTIONS))
+            new_model = MODEL_OPTIONS[selected]
+            if cfg["model"] != new_model:
+                cfg["model"] = new_model
+                save_persistent_config(cfg)
+                print(f"Saved: model = {cfg['model']}")
+                requires_restart = True
+            else:
+                print("No changes made.")
+
+        elif choice == 1:
+            print("\nLanguage options:")
+            for i, lang in enumerate(LANGUAGE_OPTIONS, 1):
+                print(f"{i}) {lang}")
+            print("Select language number:")
+            selected = _prompt_choice(len(LANGUAGE_OPTIONS))
+            new_language = LANGUAGE_OPTIONS[selected]
+            if cfg["language"] != new_language:
+                cfg["language"] = new_language
+                save_persistent_config(cfg)
+                print(f"Saved: language = {cfg['language']}")
+                requires_restart = True
+            else:
+                print("No changes made.")
+
+        elif choice == 2:
+            print("\nHotkey options:")
+            for i, hotkey in enumerate(HOTKEY_OPTIONS, 1):
+                print(f"{i}) {hotkey}")
+            print(f"{len(HOTKEY_OPTIONS) + 1}) Custom...")
+            print("Select hotkey number:")
+            selected = _prompt_choice(len(HOTKEY_OPTIONS) + 1)
+            if selected < len(HOTKEY_OPTIONS):
+                new_hotkey = HOTKEY_OPTIONS[selected]
+                if cfg["hotkey"] != new_hotkey:
+                    cfg["hotkey"] = new_hotkey
+                    save_persistent_config(cfg)
+                    print(f"Saved: hotkey = {cfg['hotkey']}")
+                    requires_restart = True
+                else:
+                    print("No changes made.")
+            else:
+                print("Enter custom hotkey (example: Ctrl+Alt+X or CapsLock):")
+                raw = input("> ").strip()
+                normalized = normalize_hotkey_label(raw)
+                if _is_parseable_hotkey(normalized):
+                    if cfg["hotkey"] != normalized:
+                        cfg["hotkey"] = normalized
+                        save_persistent_config(cfg)
+                        print(f"Saved: hotkey = {cfg['hotkey']}")
+                        requires_restart = True
+                    else:
+                        print("No changes made.")
+                else:
+                    print("Invalid hotkey format. No changes made.")
+
+        elif choice == 3:
+            print("\nCopy to Clipboard:")
+            print("1) ON")
+            print("2) OFF")
+            selected = _prompt_choice(2)
+            new_clipboard_enabled = (selected == 0)
+            if cfg["clipboard_enabled"] != new_clipboard_enabled:
+                cfg["clipboard_enabled"] = new_clipboard_enabled
+                if not cfg["clipboard_enabled"]:
+                    cfg["paste_enabled"] = False
+                save_persistent_config(cfg)
+                print(f"Saved: clipboard_enabled = {cfg['clipboard_enabled']}")
+                requires_restart = True
+            else:
+                print("No changes made.")
+
+        elif choice == 4:
+            print("\nAuto Paste:")
+            print("1) ON")
+            print("2) OFF")
+            selected = _prompt_choice(2)
+            new_paste_enabled = (selected == 0)
+            if cfg["paste_enabled"] != new_paste_enabled:
+                cfg["paste_enabled"] = new_paste_enabled
+                if cfg["paste_enabled"]:
+                    cfg["clipboard_enabled"] = True
+                save_persistent_config(cfg)
+                print(f"Saved: paste_enabled = {cfg['paste_enabled']}")
+                requires_restart = True
+            else:
+                print("No changes made.")
+
+        elif choice == 5:
+            print("\nSound Notifications:")
+            print("1) ON")
+            print("2) OFF")
+            selected = _prompt_choice(2)
+            new_sound_notifications = (selected == 0)
+            if bool(cfg.get("sound_notifications", False)) != new_sound_notifications:
+                cfg["sound_notifications"] = new_sound_notifications
+                save_persistent_config(cfg)
+                print(f"Saved: sound_notifications = {cfg['sound_notifications']}")
+                requires_restart = True
+            else:
+                print("No changes made.")
+
+        else:
+            print("Exiting LinuxFlow configuration.")
+            return
+
+        if requires_restart and _prompt_yes_no("Restart LinuxFlow service now to apply this change?"):
+            if restart_linuxflow_service():
+                print("LinuxFlow service restarted.")
+            else:
+                print("Could not restart service automatically. Run: systemctl --user restart linuxflow.service")
+
+
 # ---------- Core functions ----------
 
 def list_devices():
@@ -907,8 +1080,13 @@ def daemon_mode(args):
 
     def restart_service():
         try:
-            subprocess.Popen(["systemctl", "--user", "restart", "linuxflow.service"])
-            return True
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", "linuxflow.service"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
         except Exception as e:
             print(f"  Restart failed: {e}")
             return False
@@ -953,7 +1131,10 @@ def daemon_mode(args):
             with settings_lock:
                 settings["model"] = model_name
             save_settings()
-            restart_service()
+            if restart_service():
+                notify("LinuxFlow", f"Model changed to {model_name}. Service restarted.")
+            else:
+                notify("LinuxFlow", "Model changed, but service restart failed.")
         return _handler
 
     def set_language(language_name):
@@ -1053,32 +1234,32 @@ def daemon_mode(args):
 
     def checked_setting(key):
         def _checked(item):
-            with settings_lock:
-                return bool(settings.get(key))
+            latest = load_persistent_config()
+            return bool(latest.get(key))
         return _checked
 
     def checked_model(model_name):
         def _checked(item):
-            with settings_lock:
-                return settings["model"] == model_name
+            latest = load_persistent_config()
+            return latest.get("model") == model_name
         return _checked
 
     def checked_language(language_name):
         def _checked(item):
-            with settings_lock:
-                return settings["language"] == language_name
+            latest = load_persistent_config()
+            return latest.get("language") == language_name
         return _checked
 
     def checked_hotkey(hotkey_name):
         def _checked(item):
-            with settings_lock:
-                return settings["hotkey"] == hotkey_name
+            latest = load_persistent_config()
+            return latest.get("hotkey") == hotkey_name
         return _checked
 
     def checked_icon_theme(icon_theme):
         def _checked(item):
-            with settings_lock:
-                return settings.get("icon_theme", "auto") == icon_theme
+            latest = load_persistent_config()
+            return latest.get("icon_theme", "auto") == icon_theme
         return _checked
 
     tray_icon = pystray.Icon(
@@ -1252,6 +1433,7 @@ def main():
     parser.add_argument("--no-paste", action="store_true", help="Don't auto-paste after copying to clipboard")
     parser.add_argument("--device", type=int, default=None, help="Audio input device index")
     parser.add_argument("--devices", action="store_true", help="List audio devices and exit")
+    parser.add_argument("--config", action="store_true", help="Open interactive configuration menu and exit")
     parser.add_argument("--daemon", action="store_true", help="Run as background daemon with tray icon + hotkey")
     parser.add_argument("--asr-timeout", type=float, default=ASR_TIMEOUT_S, help="ASR request timeout in seconds")
     parser.add_argument("--asr-retries", type=int, default=ASR_RETRIES, help="Number of ASR retries after failure")
@@ -1264,6 +1446,10 @@ def main():
 
     if args.devices:
         list_devices()
+        sys.exit(0)
+
+    if args.config:
+        configure_settings_menu()
         sys.exit(0)
 
     if args.daemon:
