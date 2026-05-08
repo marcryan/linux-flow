@@ -18,12 +18,14 @@ Daemon mode:
 import argparse
 import configparser
 import ctypes
+from collections import deque
 from datetime import datetime
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import signal
 import os
+import re
 import selectors
 import subprocess
 import sys
@@ -95,6 +97,11 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "linuxflow")
 PID_FILE = os.path.join(STATE_DIR, "linuxflow.pid")
+TRANSCRIPT_LOG_PATH = os.path.join(STATE_DIR, "transcript_log.md")
+# In-process heading cache avoids re-reading the file; duplicate "## date" sections can appear across restarts.
+_transcript_log_last_heading_date = None
+RECENT_TRANSCRIPTIONS_MAX = 5
+RECENT_TRANSCRIPT_MENU_MAX_CHARS = 52
 SOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 MIN_DURATION = 0.2  # seconds - allow short one-word utterances
 POST_RELEASE_BUFFER = 0.35  # seconds - capture trailing phonemes after key release
@@ -144,6 +151,149 @@ logger.setLevel(logging.INFO)
 def log_event(level, event, **fields):
     parts = [event] + [f"{k}={repr(v)}" for k, v in fields.items()]
     logger.log(level, " ".join(parts))
+
+
+def ensure_transcript_log_file():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(TRANSCRIPT_LOG_PATH):
+        return
+    with open(TRANSCRIPT_LOG_PATH, "w", encoding="utf-8") as fh:
+        fh.write("# LinuxFlow transcript log\n\n")
+
+
+def _warm_transcript_log_heading_cache_from_file():
+    """If the daemon/CLI restarts mid-day, learn the newest ## heading so we don't stack duplicates."""
+    global _transcript_log_last_heading_date
+    if _transcript_log_last_heading_date is not None:
+        return
+    try:
+        if not os.path.isfile(TRANSCRIPT_LOG_PATH):
+            return
+        size = os.path.getsize(TRANSCRIPT_LOG_PATH)
+        if size == 0:
+            return
+        with open(TRANSCRIPT_LOG_PATH, "rb") as fh:
+            fh.seek(max(0, size - 8192))
+            tail = fh.read().decode("utf-8", errors="replace")
+        for raw in reversed(tail.splitlines()):
+            line = raw.strip()
+            if line.startswith("## ") and len(line) >= 13:
+                _transcript_log_last_heading_date = line[3:].strip().split()[0]
+                break
+    except OSError:
+        pass
+
+
+def append_transcript_log(
+    text: str,
+    *,
+    language,
+    audio_duration_s,
+    transcribe_duration_s,
+    session,
+    source,
+):
+    """Append one successful transcription to the dated log (plain append; no flock)."""
+    global _transcript_log_last_heading_date
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return
+    ensure_transcript_log_file()
+    _warm_transcript_log_heading_cache_from_file()
+    now = datetime.now()
+    date_h = now.strftime("%Y-%m-%d")
+    time_h = now.strftime("%H:%M:%S")
+    meta_bits = [
+        f"session={session}",
+        f"source={source}",
+        f"lang={language or '?'}",
+        f"audio={audio_duration_s:.2f}s" if audio_duration_s is not None else None,
+        f"asr={transcribe_duration_s:.2f}s" if transcribe_duration_s is not None else None,
+    ]
+    meta_line = " · ".join(b for b in meta_bits if b)
+    chunks = []
+    if _transcript_log_last_heading_date != date_h:
+        if _transcript_log_last_heading_date is not None:
+            chunks.append("\n")
+        chunks.append(f"## {date_h}\n\n")
+        _transcript_log_last_heading_date = date_h
+    chunks.append(f"### {time_h}\n{meta_line}\n\n{cleaned}\n\n")
+    payload = "".join(chunks)
+    with open(TRANSCRIPT_LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+
+
+def clear_transcript_log_file():
+    """Remove all transcription entries from the log file (fresh header only) and reset day-heading cache."""
+    global _transcript_log_last_heading_date
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _transcript_log_last_heading_date = None
+    with open(TRANSCRIPT_LOG_PATH, "w", encoding="utf-8") as fh:
+        fh.write("# LinuxFlow transcript log\n\n")
+
+
+def open_transcript_log_viewer():
+    ensure_transcript_log_file()
+    try:
+        subprocess.Popen(
+            ["xdg-open", TRANSCRIPT_LOG_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"Could not open transcript log: {e}")
+        print(f"Path: {TRANSCRIPT_LOG_PATH}")
+
+
+def format_transcript_tray_label(text, max_chars=None):
+    """Single-line tray label with middle collapse; ellipsis when long."""
+    if max_chars is None:
+        max_chars = RECENT_TRANSCRIPT_MENU_MAX_CHARS
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return " "
+    if len(collapsed) <= max_chars:
+        return collapsed
+    keep = max(1, max_chars - 1)
+    return collapsed[:keep].rstrip() + "…"
+
+
+def load_recent_transcript_texts_from_log(limit=RECENT_TRANSCRIPTIONS_MAX):
+    """Read transcript_log.md tail; newest entries first."""
+    if limit <= 0:
+        return []
+    if not os.path.isfile(TRANSCRIPT_LOG_PATH):
+        return []
+    try:
+        size = os.path.getsize(TRANSCRIPT_LOG_PATH)
+        read_len = min(size, 98304)
+        with open(TRANSCRIPT_LOG_PATH, "rb") as fh:
+            fh.seek(size - read_len)
+            blob = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    parts = re.split(r"(?m)^### \d{2}:\d{2}:\d{2}\r?\n", blob)
+    newest_first = []
+    for segment in reversed(parts):
+        segment = segment.strip()
+        if not segment:
+            continue
+        lines = segment.splitlines()
+        if not lines:
+            continue
+        head = lines[0]
+        if "session=" not in head and "source=" not in head:
+            continue
+        i = 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        body = "\n".join(lines[i:]).strip()
+        if body:
+            newest_first.append(body)
+            if len(newest_first) >= limit:
+                break
+    return newest_first
 
 
 def _backup_broken_config_file():
@@ -811,7 +961,7 @@ def load_tray_icons(icon_theme="auto"):
     for color, state in state_to_name.items():
         chosen = None
         for size in sizes:
-            candidate = os.path.join(icon_root, f"{variant}-{state}-{size}.png")
+            candidate = os.path.join(icon_root, f"icon-{variant}-{state}-{size}.png")
             if os.path.exists(candidate):
                 try:
                     chosen = Image.open(candidate).convert("RGBA")
@@ -925,6 +1075,20 @@ def daemon_mode(args):
     tray = None
     session_count = 0
     shutdown_event = threading.Event()
+    recent_transcripts = deque(maxlen=RECENT_TRANSCRIPTIONS_MAX)
+    recent_transcripts_lock = threading.Lock()
+    tray_menu_refresh = None
+
+    def remember_recent_transcription(full_text):
+        snippet = (full_text or "").strip()
+        if not snippet:
+            return
+        snippet = snippet.replace("\x00", "")
+        with recent_transcripts_lock:
+            recent_transcripts.appendleft(snippet)
+        updater = tray_menu_refresh
+        if updater:
+            updater()
 
     # Pre-create icons to avoid GTK calls from threads
     icons, theme_variant, icon_theme_mode = load_tray_icons(settings.get("icon_theme", "auto"))
@@ -1052,46 +1216,62 @@ def daemon_mode(args):
             local_language = settings["language"]
         lang_local = None if local_language == "auto" else local_language
 
-        # Use the currently selected language setting.
-        start = time.time()
+        # Always return tray to Ready after transcribing (even if log/clipboard/paste fails).
         try:
-            transcript = asr_backend.transcribe(audio, language=lang_local)
-            text = transcript.text
-            detected_lang = transcript.language
-        except Exception as e:
-            print(f"  Transcription failed: {e}")
-            log_event(logging.ERROR, "transcription_failed", error=str(e))
+            # Use the currently selected language setting.
+            start = time.time()
+            try:
+                transcript = asr_backend.transcribe(audio, language=lang_local)
+                text = transcript.text
+                detected_lang = transcript.language
+            except Exception as e:
+                print(f"  Transcription failed: {e}")
+                log_event(logging.ERROR, "transcription_failed", error=str(e))
+                return
+            elapsed = time.time() - start
+
+            if not text:
+                return
+
+            session_count += 1
+            print(f"  [{session_count}] ({detected_lang}, {duration:.1f}s audio, {elapsed:.1f}s transcribe)")
+            if args.debug_transcript:
+                print(f"  >>> {text}")
+            log_event(
+                logging.INFO,
+                "transcription_succeeded",
+                session=session_count,
+                language=detected_lang,
+                audio_duration_s=round(duration, 2),
+                transcribe_duration_s=round(elapsed, 2),
+            )
+            try:
+                append_transcript_log(
+                    text,
+                    language=detected_lang,
+                    audio_duration_s=duration,
+                    transcribe_duration_s=elapsed,
+                    session=session_count,
+                    source="daemon",
+                )
+            except Exception as e:
+                log_event(logging.WARNING, "transcript_log_append_failed", error=str(e))
+
+            remember_recent_transcription(text)
+
+            if local_clipboard_enabled:
+                try:
+                    insert_text = format_for_insert(text, append_space=local_append_space)
+                    copied = copy_to_clipboard(insert_text)
+                    if copied and local_paste_enabled:
+                        # Give compositor/focus a brief moment before sending paste hotkey.
+                        time.sleep(0.2)
+                        if not paste_from_clipboard(text=insert_text):
+                            print("  [paste] failed (ensure ydotoold is running)")
+                except Exception as e:
+                    log_event(logging.WARNING, "clipboard_paste_pipeline_failed", error=str(e))
+        finally:
             refresh_ready_tray()
-            return
-        elapsed = time.time() - start
-
-        if not text:
-            refresh_ready_tray()
-            return
-
-        session_count += 1
-        print(f"  [{session_count}] ({detected_lang}, {duration:.1f}s audio, {elapsed:.1f}s transcribe)")
-        if args.debug_transcript:
-            print(f"  >>> {text}")
-        log_event(
-            logging.INFO,
-            "transcription_succeeded",
-            session=session_count,
-            language=detected_lang,
-            audio_duration_s=round(duration, 2),
-            transcribe_duration_s=round(elapsed, 2),
-        )
-
-        if local_clipboard_enabled:
-            insert_text = format_for_insert(text, append_space=local_append_space)
-            copied = copy_to_clipboard(insert_text)
-            if copied and local_paste_enabled:
-                # Give compositor/focus a brief moment before sending paste hotkey.
-                time.sleep(0.2)
-                if not paste_from_clipboard(text=insert_text):
-                    print("  [paste] failed (ensure ydotoold is running)")
-
-        refresh_ready_tray()
 
     def hotkey_listener():
         pressed = set()
@@ -1141,16 +1321,6 @@ def daemon_mode(args):
                 except Exception:
                     pass
 
-    def save_settings():
-        with settings_lock:
-            save_persistent_config(dict(settings))
-        if tray:
-            try:
-                tray.update_menu()
-            except Exception:
-                pass
-        refresh_ready_tray()
-
     def refresh_tray_icons():
         nonlocal icons
         with settings_lock:
@@ -1187,6 +1357,9 @@ def daemon_mode(args):
             subprocess.Popen(["xdg-open", log_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"  Could not open logs: {e}")
+
+    def open_transcript_log():
+        open_transcript_log_viewer()
 
     def toggle_recording(icon_ref, item):
         with recording_lock:
@@ -1289,6 +1462,20 @@ def daemon_mode(args):
     def on_open_logs(icon_ref, item):
         open_logs()
 
+    def on_open_transcript_log(icon_ref, item):
+        open_transcript_log()
+
+    def on_clear_transcript_logs(icon_ref, item):
+        try:
+            clear_transcript_log_file()
+        except OSError as e:
+            log_event(logging.WARNING, "transcript_log_clear_failed", error=str(e))
+            return
+        with recent_transcripts_lock:
+            recent_transcripts.clear()
+        refresh_tray_menu()
+        log_event(logging.INFO, "transcript_log_cleared")
+
     def on_quit(icon_ref, item):
         nonlocal recording, rec_process, rec_tmpfile
         shutdown_event.set()
@@ -1314,6 +1501,13 @@ def daemon_mode(args):
         nonlocal tray
         tray = icon_ref
         tray.visible = True
+        thawed = load_recent_transcript_texts_from_log(limit=RECENT_TRANSCRIPTIONS_MAX)
+        if thawed:
+            with recent_transcripts_lock:
+                recent_transcripts.clear()
+                for snippet in thawed:
+                    recent_transcripts.appendleft(snippet)
+            refresh_tray_menu()
         validate_sound_assets()
         refresh_ready_tray()
         write_pid_file()
@@ -1356,20 +1550,45 @@ def daemon_mode(args):
             return latest.get("icon_theme", "auto") == icon_theme
         return _checked
 
-    tray_icon = pystray.Icon(
-        "linuxflow",
-        icon=icons["green"],
-        title=f"LinuxFlow - Ready ({current_hotkey_label()})",
-        menu=pystray.Menu(
+    def on_copy_recent_transcript(payload):
+        normalized = payload.replace("\x00", "")
+
+        def _handler(icon_ref, item):
+            if not copy_to_clipboard(normalized):
+                log_event(logging.WARNING, "recent_transcript_copy_failed")
+
+        return _handler
+
+    def build_tray_menu():
+        with recent_transcripts_lock:
+            snap = list(recent_transcripts)
+        submenu_entries = []
+        if snap:
+            submenu_entries.extend(
+                pystray.MenuItem(
+                    format_transcript_tray_label(body),
+                    on_copy_recent_transcript(body),
+                )
+                for body in snap
+            )
+        else:
+            submenu_entries.append(pystray.MenuItem("(No recent yet)", None, enabled=False))
+        submenu_entries.append(pystray.Menu.SEPARATOR)
+        submenu_entries.append(pystray.MenuItem("Open Transcript Log", on_open_transcript_log))
+        submenu_entries.append(pystray.MenuItem("Clear logs", on_clear_transcript_logs))
+
+        submenu_transcriptions = pystray.Menu(*submenu_entries)
+
+        return pystray.Menu(
             pystray.MenuItem("LinuxFlow", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Start / Stop Recording", toggle_recording, checked=is_recording_checked, default=True),
             pystray.MenuItem("Restart Service", on_restart),
             pystray.MenuItem("Open Logs", on_open_logs),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Copy to Clipboard", on_toggle_clipboard, checked=checked_setting("clipboard_enabled")),
-            pystray.MenuItem("Auto Paste", on_toggle_paste, checked=checked_setting("paste_enabled")),
-            pystray.MenuItem("Sound Notifications", on_toggle_sound_notifications, checked=checked_setting("sound_notifications")),
+            pystray.MenuItem(
+                "Transcriptions",
+                submenu_transcriptions,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Model",
@@ -1413,9 +1632,53 @@ def daemon_mode(args):
                     for theme_name in ICON_THEME_OPTIONS
                 ]),
             ),
+            pystray.MenuItem(
+                "Behaviors",
+                pystray.Menu(
+                    pystray.MenuItem("Copy to Clipboard", on_toggle_clipboard, checked=checked_setting("clipboard_enabled")),
+                    pystray.MenuItem("Auto Paste", on_toggle_paste, checked=checked_setting("paste_enabled")),
+                    pystray.MenuItem("Sound Notifications", on_toggle_sound_notifications, checked=checked_setting("sound_notifications")),
+                ),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
-        ),
+        )
+
+    def refresh_tray_menu():
+        ic = tray
+        if not ic:
+            return
+
+        def _gtk_apply():
+            try:
+                ic.menu = build_tray_menu()
+                ic.update_menu()
+            except Exception:
+                pass
+            return False
+
+        if HAS_GLIB:
+            GLib.idle_add(_gtk_apply)
+        else:
+            try:
+                ic.menu = build_tray_menu()
+                ic.update_menu()
+            except Exception:
+                pass
+
+    def save_settings():
+        with settings_lock:
+            save_persistent_config(dict(settings))
+        refresh_tray_menu()
+        refresh_ready_tray()
+
+    tray_menu_refresh = refresh_tray_menu
+
+    tray_icon = pystray.Icon(
+        "linuxflow",
+        icon=icons["green"],
+        title=f"LinuxFlow - Ready ({current_hotkey_label()})",
+        menu=build_tray_menu(),
     )
 
     try:
@@ -1491,6 +1754,17 @@ def terminal_mode(args):
             session_count += 1
             print(f"\n  [{session_count}] ({detected_lang}, {elapsed:.1f}s)")
             print(f"  >>> {text}\n")
+            try:
+                append_transcript_log(
+                    text,
+                    language=detected_lang,
+                    audio_duration_s=duration,
+                    transcribe_duration_s=elapsed,
+                    session=session_count,
+                    source="terminal",
+                )
+            except Exception as e:
+                log_event(logging.WARNING, "transcript_log_append_failed", error=str(e))
 
             if not args.no_clipboard:
                 insert_text = format_for_insert(text)
@@ -1545,6 +1819,11 @@ def main():
         action="store_true",
         help="Daemon mode only: print transcript text to stdout/stderr for debugging (may expose dictated text in journal logs)",
     )
+    parser.add_argument(
+        "--open-transcript-log",
+        action="store_true",
+        help=f"Open the transcript history file ({TRANSCRIPT_LOG_PATH}) in the default viewer and exit",
+    )
     args = parser.parse_args()
     args._provided_flags = {
         token.split("=")[0]
@@ -1558,6 +1837,10 @@ def main():
 
     if args.config:
         configure_settings_menu()
+        sys.exit(0)
+
+    if args.open_transcript_log:
+        open_transcript_log_viewer()
         sys.exit(0)
 
     if args.daemon:
