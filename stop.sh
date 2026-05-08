@@ -1,8 +1,26 @@
 #!/bin/bash
-# Stop WisprFlow - works for both systemd and manual runs
-if systemctl --user is-active wisprflow.service &>/dev/null; then
-    systemctl --user stop wisprflow.service
-    echo "WisprFlow service stopped."
+# Stop LinuxFlow - works for both systemd and manual runs
+PID_FILE="$HOME/.local/state/linuxflow/linuxflow.pid"
+
+if systemctl --user is-active linuxflow.service &>/dev/null; then
+    systemctl --user stop linuxflow.service
+    echo "LinuxFlow service stopped."
 else
-    pkill -f "wisprflow.py --daemon" && echo "WisprFlow stopped." || echo "WisprFlow not running."
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            sleep 0.4
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null
+            fi
+            rm -f "$PID_FILE"
+            echo "LinuxFlow stopped."
+        else
+            rm -f "$PID_FILE"
+            echo "LinuxFlow not running."
+        fi
+    else
+        echo "LinuxFlow not running."
+    fi
 fi
