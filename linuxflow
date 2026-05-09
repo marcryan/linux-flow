@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Installed to ~/.local/bin by install.sh — forwards to the synced venv interpreter.
+set -euo pipefail
+APP_DIR="${HOME}/.local/share/linuxflow"
+PY="${APP_DIR}/venv/bin/python"
+MAIN="${APP_DIR}/linuxflow.py"
+if [[ ! -x "$PY" ]]; then
+  echo "LinuxFlow: venv missing at $PY — run install.sh from the LinuxFlow source tree." >&2
+  exit 1
+fi
+if [[ ! -f "$MAIN" ]]; then
+  echo "LinuxFlow: app not found at $MAIN — run install.sh." >&2
+  exit 1
+fi
+exec "$PY" "$MAIN" "$@"
