@@ -1,101 +1,272 @@
 # LinuxFlow
 
-Free, offline, open-source alternative to [WisprFlow](https://wisprflow.ai) for Linux. Speak anywhere, get clean text - no cloud, no subscription, no data leaves your machine.
+Free, offline, open-source alternative to [WisprFlow](https://wisprflow.ai) for Linux. Speak in any focused window, release the hotkey, and get transcribed text on the clipboard—with optional paste into the app. Nothing is sent to the cloud unless you explicitly add that later yourself.
 
-**Hold `Ctrl+Super+Z`, speak, release - text is transcribed, copied, and auto-pasted into your focused app.**
+# **Main Features**
 
-## Quick Start (One Command)
+- **Free!!** - This doesn't cost you a thing
+- **Private** - 100% offline all processing happens locally, no internet needed
+- **Global hotkey** - Use the default `Ctrl+Super+Z` or set your own
+- **System tray icon & submenus** - Configure behavior of the app without the terminal
+- **Terminal mode** - enables transcription of text to a file and/or clipboard
+- **Clipboard + auto-paste** -  Works from any app (browser, editor, chat, etc.) transcription is copied and then pasted into the focused app
+- **Wayland + X11** - works on both via evdev + parecord
+- **Multiple languages** - auto-detection or specify with `--language`
+- **Multiple models** - trade speed for accuracy based on your hardware
+
+---
+
+# Quick start
 
 ```bash
 git clone https://github.com/marcryan/linux-flow.git
 cd linux-flow
 ./install.sh
+echo "Log out and back in, then run from system menu or terminal"
 ```
 
-Installer actions:
+After install, **`linuxflow`** runs under your user systemd session (see logs below). The installer adds you to the **`input`** group for global hotkeys (evdev); **log out and back in** (or reboot) so that takes effect without fallbacks.
 
-- installs distro dependencies (`apt`, `dnf`, `pacman`)
-- creates `~/.local/share/linuxflow` with an isolated venv
-- installs user service: `~/.config/systemd/user/linuxflow.service`
-- installs launcher: `~/.local/share/applications/linuxflow.desktop`
-- adds your user to the `input` group so LinuxFlow can read keyboard devices for the global hotkey (full effect after logout/login; until then `start.sh` may use `sg input`)
+---
 
-### Security
+# Usage
 
-LinuxFlow reads `/dev/input/event*` (via evdev) for the global hotkey. Older installers used a broad `udev` `uaccess` rule that granted access to **every** keyboard device for your login session — including sandboxed apps — which widened attack surface. Current installs use the standard **`input` group** instead (same broad device access as other input tooling, but no extra system-wide ACL beyond that pattern).
+## From KDE/Plasma
 
-If install added you to `input` and you uninstall, run `sudo gpasswd -d "$USER" input` if you want to leave the group (re-login afterward).
+#### Basic Use
 
-## How It Works
+1. Click into text field in desired app
+2. Hold Hotkey (Ctrl+Super+Z)
+3. mic records
+4. release hotkey
+5. faster-whisper transcribes
+6. text added to clipboard & auto-pasted into app
+
+### Tray icon meanings (default theme)
+
+The tray uses PNGs named **`idle`** / **`rec`** / **`pro`** (light or dark variant). In the default set they read as:
+
+- **White**: idle / ready
+- **Green**: recording
+- **Orange**: transcribing (processing)
+
+#### Options
+
+LinuxFlow runs in the system tray. Clicking on the icon provides a context menu of configurable options.
+
+- **Start/stop** recording: a  manual toggle which mirrors the hardware hotkey pipeline
+- **Restart service**, **Open logs**, **Quit Application**
+- **Transcriptions** submenu: 
+  - copies of the last few transcripts (click to copy to clipboard), 
+  - **open transcript Markdown logs**, 
+  - **clear logs**
+- **Models** submenu:
+  - Tiny
+  - Base
+  - Small (default)
+  - Medium
+  - Large-v3-turbo
+- **Language** submenu
+  - Choose from several supported languages
+- **Hotkey** submenu:
+  - Default (Ctrl+Super+Z)
+  - Several Built in Options
+  - Choose your own hotkey
+- **Behaviors** submenu:
+  - Toggle clipboard copy
+  - Toggle Auto Paste
+  - Toggle Sound Notifications
+- **Icons** submenu:
+  - Forces refresh of icons or match system theme
+
+## From Terminal
+
+After **`./install.sh`** you get **`~/.local/bin/linuxflow`**, which runs the installed copy with **`~/.local/share/linuxflow/venv`** — from **any directory**:
+
+#### Start Recording
+
+```bash
+linuxflow
+```
+
+#### Configure Options
+
+```bash
+linuxflow --config
+```
+
+#### Select device
+
+```bash
+linuxflow --devices
+```
+
+#### Show Transcriptions
+
+```bash
+linuxflow --transcript N
+
+# Replace N with number of recordings to display #
+```
+
+**Do not** run **`python linuxflow.py`** from the **git clone** unless `python` is that clone’s venv: your default interpreter is usually **system** Python → **`No module named 'pyaudio'`**. Use **`linuxflow`** instead.
+
+- **Fish:** installer adds **`~/.config/fish/conf.d/linuxflow-path.fish`**. Open a **new terminal** or **`exec fish`**, then **`linuxflow`**.
+- **Bash/zsh:** add **`PATH`** if needed: **`export PATH="$HOME/.local/bin:$PATH"`**
+- Fallback: **`~/.local/share/linuxflow/venv/bin/python ~/.local/share/linuxflow/linuxflow.py`**
+
+
+
+---
+
+# Installation
+
+Follow the quick set-up instructions above.
+
+## What `./install.sh` does
+
+Installs distro packages where it can (**pacman**, **apt**, or **dnf**), then:
+
+- Copies the app into **`~/.local/share/linuxflow`**
+- Creates a dedicated venv at **`~/…/linuxflow/venv`** and installs Python deps from **`requirements.txt`**
+- Writes a systemd user unit at **`~/.config/systemd/user/linuxflow.service`**
+- Installs **`~/.local/bin/linuxflow`** and, if **`fish`** is installed, **`~/.config/fish/conf.d/linuxflow-path.fish`**, so **`~/.local/bin`** is on **`PATH`** in new Fish sessions
+- Adds **`~/.local/share/applications/linuxflow.desktop`** with **`Icon=`** set to **`icons/linuxflowicon.svg`** (PNG fallback if that file is missing)
+- Adds your user to the Unix **`input`** group so the process can open **`/dev/input/event*`** for global hotkeys
+- Removes a legacy **`udev`/`uaccess`** keyboard rule (**`70-linuxflow-input.rules`**), if present, in favor of the **`input`** group approach
+
+HF / model cache for faster-whisper is directed to **`~/.local/state/linuxflow/hf-cache`** via the unit’s **`HF_HOME`** environment variable.
+
+### Security note
+
+Reading keyboard devices (**`evdev`**) is inherently privileged compared to sandboxed GUI apps—the tradeoff enables a global shortcut on Wayland and X11. Older installers used an overly broad **`udev`/`uaccess`** rule that could expose **all** keyboards to session seat ACLs beyond what you get from **`input`** membership alone. Current installs rely on **`input`** (like many other utilities) plus optional **`sg input`** fallback in **`start.sh`** until your session sees the group.
+
+Leaving **`input`** after uninstall: `./uninstall.sh` prints **`gpasswd`** instructions; you stay in **`input`** until you explicitly remove yourself and re-login.
+
+## How it runs
+
+Typical daemon flow:
 
 ```
-Hold Ctrl+Super+Z → mic records → release → faster-whisper transcribes → clipboard + auto-paste
+Global hotkey (evdev)
+    → parecord OR pw-record (16 kHz WAV to a temp file)
+    → FasterWhisperBackend (spawned worker, CPU int8, optional VAD tail padding)
+    → optional transcript Markdown log
+    → wl-copy/xclip (+ ydotool/xdotool typing fallback paste)
 ```
 
-Two modes:
+**Terminal mode** is different by design: it records with **PyAudio** streams (**Enter** to stop recording, **ESC** to exit or discard the current clip), not `parecord`/`pw-record`. Use it for microphone testing and scripted use.
+
+## Where configuration and data live
 
 
-| Mode         | How to run                     | How it works                                          |
-| ------------ | ------------------------------ | ----------------------------------------------------- |
-| **Daemon**   | `python linuxflow.py --daemon` | System tray icon + global hotkey. No terminal needed. |
-| **Terminal** | `python linuxflow.py`          | Press Enter to start/stop. Good for testing.          |
+| Path                                         | Purpose                                                    |
+| -------------------------------------------- | ---------------------------------------------------------- |
+| `~/.config/linuxflow/config.json`            | Persistent daemon settings (validated keys only)           |
+| `~/.local/state/linuxflow/linuxflow.log`     | Rotating application logs                                  |
+| `~/.local/state/linuxflow/transcript_log.md` | Append-only Markdown history (daemon + terminal successes) |
+| `~/.local/state/linuxflow/hf-cache`          | Whisper model downloads (via `HF_HOME` in systemd)         |
+| `~/.local/state/linuxflow/linuxflow.pid`     | Daemon PID for stop helpers                                |
 
 
-## Features
-
-- **100% offline** - all processing happens locally, no internet needed
-- **Global hotkey** - `Ctrl+Super+Z` works from any app (browser, editor, chat, etc.)
-- **System tray icon** - theme-aware light/dark assets (idle/recording/transcribing)
-- **Tray settings menu** - right-click tray icon to change model, language, hotkey, and behavior toggles
-- **Clipboard + auto-paste** - transcription is copied and then pasted into the focused app
-- **Optional hotkey sounds** - play custom start/stop sounds on key press/release
-- **Wayland + X11** - works on both via evdev + parecord
-- **100+ languages** - auto-detection or specify with `--language`
-- **Multiple models** - trade speed for accuracy based on your hardware
-- **No completion toasts** - no desktop notification popups after transcription
-- **Short utterance tuning** - better one-word capture and reduced last-word clipping
-
-## RAM & Performance
-
-Tested on Intel i5-10210U (4 cores), 16GB RAM, Fedora 43.
 
 
-| Model            | RAM Usage      | Transcription Speed | Quality   | Best For                         |
-| ---------------- | -------------- | ------------------- | --------- | -------------------------------- |
-| `tiny`           | ~300 MB        | ~0.7s for 10s audio | Basic     | Quick notes, fast hardware       |
-| `base`           | ~500 MB        | ~1.2s for 10s audio | OK        | Everyday use on low-end hardware |
-| `small`          | ~625 MB        | ~4s for 25s audio   | Good      | **Recommended for most users**   |
-| `medium`         | ~2.5 GB        | ~8s for 25s audio   | Great     | When accuracy matters            |
-| `large-v3-turbo` | ~2.5 GB (INT8) | ~6s for 25s audio   | Near-best | 16GB+ RAM systems                |
+**`config.json` keys** (`linuxflow.py` schema):
 
 
-Models download automatically on first run. The `small` model (~500MB download) is the default.
+| Key                     | Meaning                                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `model`                 | `tiny`, `base`, `small`, `medium`, `large-v3-turbo` (default `small`)                                                       |
+| `language`              | `auto`, `en`, `es`, `fr`, `de`, `hi` (default `en`) — these are **the built-in presets** surfaced in trays/menus            |
+| `hotkey`                | Parsed combo string stored after validation (supports optional **custom** combos from tray or **`--hotkey`** where allowed) |
+| `clipboard_enabled`     | Copy transcript to clipboard (default true)                                                                                 |
+| `paste_enabled`         | Auto paste / type-after-copy pipe (forces clipboard on when true)                                                           |
+| `sound_notifications`   | Play **`sounds/start.wav`** / **`sounds/stop.wav`** toggles                                                                 |
+| `append_space`          | Append trailing space before copy/paste (default true)                                                                      |
+| `release_tail_buffer_s` | Daemon-only extra seconds sampled after releasing the hotkey to reduce clipping (**0.1–1.5**, default **`0.55`**)           |
+| `icon_theme`            | `auto`, `light`, or **`dark`** for tray PNG variants (`icons/icon-<variant>-<state>-*.png`)                                 |
 
-## Installation
 
-### Prerequisites
 
-- Linux (tested on Fedora 43, should work on Ubuntu/Arch/etc.)
-- Python 3.10+
-- PipeWire or PulseAudio (default on modern distros)
-- A microphone
 
-### Step 1: Run installer
+The keys **`append_space`**, **`release_tail_buffer_s`**, and **`icon_theme`** are not editable via **`python linuxflow.py --config`** — set them manually in **`config.json`**.
+
+
+
+Changing tray **model** invokes **`systemctl --user restart linuxflow.service`** via **`notify-send`** feedback (success vs failure).
+
+
+
+## Command-line modes
+
+
+| Mode                        | Command                        | Notes                                                                                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Daemon / tray / hotkeys** | `python linuxflow.py --daemon` | Records through **`parecord`/`pw-record`**. Persisted daemon settings load from **`config.json`**. First-run CLI flags (**`--model`**, **`--language`**, **`--hotkey`**, **`--no-clipboard`**, **`--no-paste`**) merge into config before the tray starts saving again. **`--hotkey`** is limited to presets listed in **`--help`**. **`--device` is unsupported** — parser errors if paired with **`--daemon`**. |
+| **Terminal dictation test** | `python linuxflow.py`          | **`--device N`** selects PyAudio mic index (**`--devices`** lists inputs). Clipboard/paste obey **`--no-clipboard`** / **`--no-paste`**. Clipboard insert uses default trailing-space behavior here (daemon honors **`append_space`** from config).                                                                                                                                                       |
+| **TTY settings wizard**     | `python linuxflow.py --config` | Same subset as tray for model/language/hotkey/clipboard/paste/sound plus **start at login** (systemd user); optional immediate **`systemctl --user restart`**. Missing advanced JSON keys—edit **`config.json`** manually.                                                                                                                                                                                                                   |
+
+
+
+
+Extra utilities:
+
+```bash
+python linuxflow.py --devices
+python linuxflow.py --transcript 5    # last N lines from transcript_log.md to stdout
+python linuxflow.py --open-transcript-log # xdg-opens transcript_log.md
+```
+
+
+
+### Full flag table
+
+
+| Flag                             | Effect                                                                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--daemon`                       | Tray + keyboard listener                                                                                          |
+| `--model NAME`                   | ASR backbone profile (preset list in `--help`; default CLI default `small` before persistence merge at tray boot) |
+| `--language LANG`                | `auto` / `en` / `es` / `fr` / `de` / `hi`                                                                         |
+| `--hotkey COMBO`                 | Preset combos only (**Ctrl+Super+Z** default)—custom combos require tray dialog or **`config.json`**              |
+| `--no-clipboard` / `--no-paste`  | Disable clipboard / downstream paste (**daemon**: writes false into **`config.json`**)                            |
+| `--device N`                     | Mic index (**terminal-only**)                                                                                     |
+| `--devices`                      | List PyAudio captures & exit                                                                                      |
+| `--config`                       | Interactive menu & exit                                                                                           |
+| `--asr-timeout`, `--asr-retries` | Worker timeout/backoff knobs                                                                                      |
+| `--transcript N`                 | Print last *N* transcript bodies from the log to stdout (text only) and exit                                      |
+| `--debug-transcript`             | **Daemon only:** print transcript snippets to stderr (may leak dictation into **`journalctl`**)                   |
+| `--open-transcript-log`          | Open Markdown history externally                                                                                  |
+
+
+Bundled WAV hotkey cues live in **`sounds/`**.
+
+
+
+## Typical installation flow
+
+Requirements: 
+
+- microphone, 
+- PulseAudio-compatible stack or PipeWire (**`pulseaudio-utils`** installs **`parecord`**; **`pipewire`** supplies **`pw-record`**), 
+- **`python3`**, plus distro tooling for **`venv`** and **`pip`**
+
+
 
 ```bash
 ./install.sh
+systemctl --user status linuxflow.service
+journalctl --user -u linuxflow.service -f
 ```
-
-### Step 2: Verify service
 
 ```bash
-systemctl --user status linuxflow.service
-journalctl --user -u linuxflow -f
+systemctl --user restart linuxflow.service
 ```
 
-Current `requirements.txt`:
 
-```txt
+
+Installed Python deps (`requirements.txt`):
+
+```
 faster-whisper>=1.0.0
 PyAudio>=0.2.13
 numpy>=1.24.0
@@ -104,200 +275,87 @@ pystray>=0.19.0
 Pillow>=10.0.0
 ```
 
-### Step 3: Run
-
-```bash
-systemctl --user restart linuxflow.service
-```
-
-The installer adds your account to the `input` group if needed. After the first install, **log out and back in** once so your session picks up the new group membership everywhere (until then, the service launcher may still start via `sg input`).
-
-## Usage
-
-### Daemon Mode (recommended)
-
-```bash
-python linuxflow.py --daemon                    # default (small model)
-python linuxflow.py --config                    # interactive settings menu
-python linuxflow.py --daemon --model tiny       # faster, less accurate
-python linuxflow.py --daemon --model medium     # slower, more accurate
-python linuxflow.py --daemon --language auto    # auto-detect language
-python linuxflow.py --daemon --language hi      # Hindi
-python linuxflow.py --daemon --no-clipboard     # don't copy to clipboard
-python linuxflow.py --daemon --no-paste         # don't auto-paste after copy
-```
-
-If you installed into `venv`, run with:
-
-```bash
-./venv/bin/python linuxflow.py --daemon
-```
-
-Then from any app: **hold `Ctrl+Super+Z`**, speak, **release**.
-
-Click the tray icon to manage (on some desktops, this is left-click instead of right-click):
-
-- start/stop recording, restart service, open logs, quit
-- clipboard/paste/sound notification toggles
-- model, language, and hotkey (persisted in `~/.config/linuxflow/config.json`)
-- force tray icon theme with `icon_theme` in `~/.config/linuxflow/config.json`: `auto`, `light`, or `dark`
-- sound files (when enabled): `sounds/start.wav` and `sounds/stop.wav`
-- trailing insertion space is configurable via `append_space` in `~/.config/linuxflow/config.json` (default `true`)
-- release tail capture is configurable via `release_tail_buffer_s` in `~/.config/linuxflow/config.json` (default `0.55`)
-- `Hotkey -> Set Custom Hotkey...` opens a dialog (kdialog/zenity) to type any combo
-  - Modifiers: `Ctrl`, `Alt`, `Shift`, `Super`
-  - Triggers: `A-Z`, `0-9`, `F1-F12`, `Space`, `Tab`, `Enter`, `Esc`, `CapsLock`
-  - Examples: `Ctrl+Alt+X`, `Ctrl+Super+F9`, `Ctrl+Shift+Space`, `CapsLock`
-
-### Terminal Mode
-
-```bash
-python linuxflow.py                             # interactive mode
-python linuxflow.py --model tiny                # use tiny model
-```
-
-Press `Enter` to start recording, `Enter` again to stop.
-
-### Terminal Config Menu
-
-Use `python linuxflow.py --config` for a numbered settings menu in terminal. It supports:
-
-- model, language, hotkey (including `CapsLock`)
-- copy to clipboard, auto paste, sound notifications
-- `Exit Config`
-
-When a change requires daemon reload (for example model/hotkey/language), the menu prompts to restart `linuxflow.service` immediately.
-
-### All Options
 
 
-| Flag              | Description                                                                      |
-| ----------------- | -------------------------------------------------------------------------------- |
-| `--daemon`        | Run as background daemon with tray icon + hotkey                                 |
-| `--model MODEL`   | ASR model profile: `tiny`, `base`, `small` (default), `medium`, `large-v3-turbo` |
-| `--language LANG` | Language code (`en`, `hi`, `es`, etc.) or `auto` for detection                   |
-| `--no-clipboard`  | Don't copy to clipboard                                                          |
-| `--no-paste`      | Don't auto-paste after copying to clipboard                                      |
-| `--config`        | Open interactive terminal menu to configure tray settings                        |
-| `--device N`      | Use specific audio input device (terminal mode only; see `--devices`)            |
-| `--devices`       | List available audio input devices                                               |
-| `--asr-timeout S` | ASR timeout in seconds (default: `30`)                                           |
-| `--asr-retries N` | Retry ASR N times after failure (default: `1`)                                   |
-| `--debug-transcript` | Daemon only: print transcript text to stdout/stderr for debugging (may expose text in `journalctl`) |
-
-By default, daemon mode does not print dictated transcript text to logs/journal. Use `--debug-transcript` only when you explicitly want local debugging output.
+Manual non-install dev runs reuse **`./venv`** or `./venv/bin/python linuxflow.py --daemon`.
 
 
-## Auto-Start on Login (systemd)
 
-`install.sh` enables this automatically:
+### `start.sh`
 
-```bash
-systemctl --user enable --now linuxflow.service
-```
-
-### Service Commands
+The systemd unit invokes **`~/.../linuxflow/start.sh`** which resolves **`./venv/bin/python`** if present, prefers direct `/dev/input` readability, falls back **`sg input`**, otherwise aborts reminding you install/re-login.
 
 
-| Command                              | What it does   |
-| ------------------------------------ | -------------- |
-| `systemctl --user start linuxflow`   | Start          |
-| `systemctl --user stop linuxflow`    | Stop           |
-| `systemctl --user restart linuxflow` | Restart        |
-| `systemctl --user status linuxflow`  | Check status   |
-| `journalctl --user -u linuxflow -f`  | View live logs |
+
+### `stop.sh`
+
+Stops the user systemd unit if possible, verifies **`linuxflow`** cmdline PID file side effects, terminates stray processes politely.
 
 
-### Manage Service Without a Console Window
 
-```bash
-systemctl --user enable --now linuxflow.service   # start now + auto-start on login
-systemctl --user restart linuxflow.service        # reload after code/config changes
-systemctl --user stop linuxflow.service           # stop service
-```
-
-## Uninstall
+### Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-## Architecture
-
-```
-┌─────────────┐     ┌──────────┐     ┌───────────────┐     ┌──────────┐
-│ evdev        │────>│ parecord │────>│ faster-whisper │────>│ wl-copy  │
-│ (hotkey)     │     │ (mic)    │     │ (STT)          │     │ (clipboard)│
-└─────────────┘     └──────────┘     └───────────────┘     └──────────┘
-```
+Removes service + desktop launcher + synced app tree (+ legacy **`udev`** file if lingering). Leaves **`input`** membership unless manually removed afterwards.
 
 
-| Component                | Tool                     | Why                                                |
-| ------------------------ | ------------------------ | -------------------------------------------------- |
-| Global hotkey            | `evdev`                  | Works on Wayland + X11 (kernel-level)              |
-| Audio capture            | `parecord` / `pw-record` | Works on PulseAudio and PipeWire setups            |
-| Speech-to-text           | `faster-whisper`         | 4x faster than OpenAI Whisper, INT8 quantization   |
-| Clipboard                | `wl-copy` / `xclip`      | Wayland-first with X11 fallback                    |
-| System tray              | `pystray`                | Cross-desktop (GNOME, KDE, etc.)                   |
-| Auto-paste/type fallback | `ydotool` / `xdotool`    | Paste first, then direct typing fallback if needed |
+
+### User service sandbox
+
+The generated unit enables **`ProtectSystem=full`**, **`NoNewPrivileges=yes`**, narrowed **`ReadWritePaths`**, plus kernel/personality hardening knobs—if you tighten further, preserve write access beneath **`~/.config/linuxflow`** and **`~/.local/state/linuxflow`**.
 
 
-## vs WisprFlow
+
+---
+
+# Model guidance (informal)
+
+Rough machine-class guidance (VRAM / RAM-heavy models need headroom—the first download can be sizable):
 
 
-|            | WisprFlow                     | LinuxFlow            |
-| ---------- | ----------------------------- | -------------------- |
-| Price      | $15/month                     | Free                 |
-| Privacy    | Cloud (audio sent to servers) | 100% local           |
-| Internet   | Required                      | Not needed           |
-| RAM        | ~800 MB (idle)                | ~300-625 MB (active) |
-| Platforms  | Mac, Windows, iOS, Android    | Linux                |
-| AI cleanup | Yes (Flow mode)               | Coming soon (Ollama) |
-| Languages  | 100+                          | 100+                 |
+| Model                       | Notes                                                      |
+| --------------------------- | ---------------------------------------------------------- |
+| `tiny` / `base`             | Fastest, lowest quality                                    |
+| `small`                     | Default balance                                            |
+| `medium` / `large-v3-turbo` | Heavier, better accuracy—ensure CPU RAM + disk cache space |
 
 
-## Troubleshooting
+---
 
-**"No keyboard found"** - Re-run `./install.sh` (it adds you to `input`), or manually: `sudo usermod -aG input "$USER"` and log out/in. Quick workaround: `newgrp input` before running.
+# Architecture summary
 
-**No tray icon on GNOME** - Install and enable the AppIndicator extension:
 
-```bash
-sudo dnf install gnome-shell-extension-appindicator
-# Then enable "AppIndicator and KStatusNotifierItem Support" in GNOME Extensions app
-```
+| Concern         | Implementation                                                                                                                                                  |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Global hotkey   | **`evdev`** readers on keyboard **`InputDevice`** nodes                                                                                                           |
+| Daemon audio    | External **`parecord`** (Pulse/PipeWire compat) or **`pw-record`**                                                                                              |
+| Terminal audio  | **`PyAudio`** streaming                                                                                                                                         |
+| ASR             | **`faster-whisper`** **`WhisperModel`** in a **`spawn`** multiprocessing worker (CPU **`int8`**), optional **`transcribe_tail_pad`**, VAD on recordings ≥ 1 s in backend |
+| Clipboard       | **`wl-copy`** / **`xclip`**                                                                                                                                     |
+| Paste           | Synthetic **Ctrl+V** via **`ydotool`**, X11 **`xdotool`**, textual **`ydotool type`** fallback                                                                  |
+| Tray / menus    | **`pystray`** + Pillow **PNG icons** with filenames prefixed **`icon-*`**                                                                                       |
+| Optional sounds | **`pw-play`** / **`paplay`** / **`aplay`**                                                                                                                      |
+| Alerts          | **`notify-send`**                                                                                                                                               |
+| Diagnostics     | Structured logging **`log_event`** to rotating file                                                                                                             |
 
-**Tray icon/menu missing on Arch/CachyOS** - Install an AppIndicator library, then restart LinuxFlow:
 
-```bash
-sudo pacman -S --needed libayatana-appindicator
-systemctl --user restart linuxflow.service
-```
+---
 
-**ALSA/GTK warnings in logs** - LinuxFlow suppresses common ALSA/GTK noise by default. Set `LINUXFLOW_SUPPRESS_ALSA_GTK_WARNINGS=0` to re-enable raw native warnings for debugging.
+# Troubleshooting shortcuts
 
-**Where logs are written** - Runtime logs are written to `~/.local/state/linuxflow/linuxflow.log` (rotated, with backups).
+**No keyboard readable / hotkey dead**: confirm **`input`** group (`id -Gn`), re-login, reinstall. **`PermissionError`** in logs ⇒ same.
 
-**Wrong language detected** - Use `--language en` (or your language code) instead of auto-detect.
+**Tray missing on GNOME / KDE derivatives**: distro **`libayatana-appindicator`** (or analogous) packages; extension “AppIndicator & KStatusNotifier” on GNOME if needed.
 
-**High latency** - Switch to a smaller model: `--model tiny` or `--model base`.
+**Recorder missing**: install **`pulseaudio-utils`** or ensure **`pw-record`** exists.
 
-**Clipboard not copying** - Install one of: `wl-clipboard` (Wayland) or `xclip` (X11).
+**Paste failure on Wayland**: start the **`ydotool`** daemon your distro ships (userspace input injection). Typical hint from the app: **`ydotoold`** running alongside **`ydotool`**.
 
-**Paste not working on Wayland** - Ensure `ydotool` service is running:
+**ALSA/GTK chatter**: suppressed by **`LINUXFLOW_SUPPRESS_ALSA_GTK_WARNINGS=1`** unless set **`0|false|no`** for raw logs.
 
-```bash
-sudo systemctl enable --now ydotool.service
-```
-
-**Short one-word dictation misses** - This build already includes shorter minimum duration + tail buffering + transcription tail padding to reduce last-word drops.
-
-## Future Plans
-
-- LLM text cleanup via Ollama (remove filler words, fix grammar - "Flow mode")
-- Custom hotkey configuration
-- Per-app tone adjustment
-
-## License
+# License
 
 MIT

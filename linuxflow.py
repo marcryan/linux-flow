@@ -3,19 +3,21 @@
 LinuxFlow - Offline voice dictation for Linux
 
 Usage:
-    python linuxflow.py                     # terminal mode (Enter to start/stop)
+    python linuxflow.py                     # terminal mode (Enter to record, ESC exits)
     python linuxflow.py --daemon            # background mode (tray icon + hotkey)
     python linuxflow.py --model tiny        # faster, lower quality
     python linuxflow.py --model base        # balanced
     python linuxflow.py --language auto     # auto-detect language
     python linuxflow.py --devices           # list audio devices
+    python linuxflow.py --transcript 5      # print last N saved transcripts (plain text)
 
 Daemon mode:
     Hold Ctrl+Super+Z to record, release to stop + transcribe.
-    System tray icon shows status: green=ready, red=recording, orange=transcribing.
+    Tray icons: idle (ready), rec (recording), pro (transcribing)—see README for default colors.
 """
 
 import argparse
+import contextlib
 import configparser
 import ctypes
 from collections import deque
@@ -26,8 +28,11 @@ from logging.handlers import RotatingFileHandler
 import signal
 import os
 import re
+import select
 import selectors
 import subprocess
+import termios
+import tty
 import sys
 import threading
 import time
@@ -77,6 +82,21 @@ if SUPPRESS_NATIVE_WARNINGS:
     except OSError:
         pass
 
+# PortAudio may probe JACK before streams open; libjack prints "connect(...) failed" to stderr.
+if SUPPRESS_NATIVE_WARNINGS:
+    try:
+        _jack = ctypes.CDLL("libjack.so.0")
+        _jack_log_cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(lambda *_: None)
+        for _sym in ("jack_set_error_function", "jack_set_info_function"):
+            _fn = getattr(_jack, _sym, None)
+            if _fn:
+                try:
+                    _fn(_jack_log_cb)
+                except Exception:
+                    pass  # mismatched SONAME/API on some installs
+    except OSError:
+        pass
+
 # Suppress GTK-CRITICAL warnings (cosmetic, from pystray on Wayland).
 if SUPPRESS_NATIVE_WARNINGS:
     try:
@@ -103,6 +123,8 @@ _transcript_log_last_heading_date = None
 RECENT_TRANSCRIPTIONS_MAX = 5
 RECENT_TRANSCRIPT_MENU_MAX_CHARS = 52
 SOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+# Returned by record_audio() when terminal user presses ESC during capture (discard, no transcript).
+RECORD_CANCELLED = object()
 MIN_DURATION = 0.2  # seconds - allow short one-word utterances
 POST_RELEASE_BUFFER = 0.35  # seconds - capture trailing phonemes after key release
 TRANSCRIBE_TAIL_PAD = 0.25  # seconds - append silence to preserve final token
@@ -132,10 +154,21 @@ CONFIG_SCHEMA = {
     "icon_theme": {"default": "auto", "type": str, "allowed": ICON_THEME_OPTIONS},
 }
 
+class _QuietStreamEventsFilter(logging.Filter):
+    """Non-fatal clipboard/paste noise: keep in rotating file log, omit from tty StreamHandler."""
+
+    _SUBSTRINGS = ("terminal_clipboard_copy_failed", "terminal_paste_fallback_failed")
+
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(s in msg for s in self._SUBSTRINGS)
+
+
 logger = logging.getLogger("linuxflow")
 if not logger.handlers:
     os.makedirs(STATE_DIR, exist_ok=True)
     handler = logging.StreamHandler()
+    handler.addFilter(_QuietStreamEventsFilter())
     handler.setFormatter(logging.Formatter("%(asctime)s level=%(levelname)s event=%(message)s"))
     logger.addHandler(handler)
     file_handler = RotatingFileHandler(
@@ -151,6 +184,105 @@ logger.setLevel(logging.INFO)
 def log_event(level, event, **fields):
     parts = [event] + [f"{k}={repr(v)}" for k, v in fields.items()]
     logger.log(level, " ".join(parts))
+
+
+@contextlib.contextmanager
+def _suppress_os_stderr():
+    """Route OS-level stderr (PortAudio/JACK chatter, etc.) to /dev/null for this thread's process FD."""
+    # Use fd 2 explicitly: some environments point sys.stderr elsewhere; C libs always use STDERR_FILENO.
+    stderr_fd = 2
+    saved = os.dup(stderr_fd)
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stderr_fd)
+        os.close(devnull)
+        yield
+    finally:
+        os.dup2(saved, stderr_fd)
+        os.close(saved)
+
+
+class _TTYEscExit(Exception):
+    """Internal: user pressed ESC — exit terminal mode."""
+
+    pass
+
+
+class _TTYRecordingCancelled(Exception):
+    """Internal: user pressed ESC while waiting to stop recording (discard clip)."""
+
+
+def _tty_was_lone_escape(stdin_fd) -> bool:
+    """After reading ESC (0x1b), return True only for a lone ESC (quit). Consume CSI/SS3 arrow/function keys."""
+    if not select.select([stdin_fd], [], [], 0.05)[0]:
+        return True
+    suffix = os.read(stdin_fd, 1).decode("latin-1", errors="ignore")
+    if suffix not in ("[", "O"):
+        log_event(logging.DEBUG, "tty_escape_non_csi_suffix", suffix=repr(suffix[:4]))
+        return False
+    rest = suffix
+    for _ in range(24):
+        if rest and rest[-1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~":
+            log_event(logging.DEBUG, "tty_escape_sequence_ignored", seq=repr(rest[:48]))
+            return False
+        if not select.select([stdin_fd], [], [], 0.05)[0]:
+            break
+        rest += os.read(stdin_fd, 1).decode("latin-1", errors="ignore")
+    log_event(logging.DEBUG, "tty_escape_sequence_ignored", seq=repr(rest[:48]))
+    return False
+
+
+def tty_prompt_enter_or_esc(prompt: str, *, esc_exits_terminal: bool = True):
+    """
+    Print prompt. Enter submits buffered line (may be empty).
+    Lone ESC -> _TTYEscExit if esc_exits_terminal else _TTYRecordingCancelled.
+    """
+    fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        line = input(prompt)
+        stripped = "" if line is None else line.rstrip("\r\n")
+        if stripped.strip().lower() in {"esc", "exit", "quit", "q"}:
+            raise _TTYEscExit()
+        return stripped
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    old = termios.tcgetattr(fd)
+    chars = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch_t = sys.stdin.read(1)
+            if not ch_t:
+                raise EOFError()
+            code = ord(ch_t)
+            if code in (10, 13):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(chars)
+            if code == 27:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                if _tty_was_lone_escape(fd):
+                    if esc_exits_terminal:
+                        raise _TTYEscExit()
+                    raise _TTYRecordingCancelled()
+                continue
+            if code in (8, 127):
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if 32 <= code < 127:
+                c = chr(code)
+                chars.append(c)
+                sys.stdout.write(c)
+                sys.stdout.flush()
+            else:
+                log_event(logging.DEBUG, "tty_ignore_control", code=code)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def ensure_transcript_log_file():
@@ -260,18 +392,33 @@ def format_transcript_tray_label(text, max_chars=None):
 
 
 def load_recent_transcript_texts_from_log(limit=RECENT_TRANSCRIPTIONS_MAX):
-    """Read transcript_log.md tail; newest entries first."""
+    """Read transcript_log.md tail; newest entries first (transcript bodies only)."""
     if limit <= 0:
         return []
     if not os.path.isfile(TRANSCRIPT_LOG_PATH):
         return []
     try:
         size = os.path.getsize(TRANSCRIPT_LOG_PATH)
-        read_len = min(size, 98304)
+        read_len = min(size, max(98304, 6144 + limit * 6144))
         with open(TRANSCRIPT_LOG_PATH, "rb") as fh:
-            fh.seek(size - read_len)
+            fh.seek(max(0, size - read_len))
             blob = fh.read().decode("utf-8", errors="replace")
     except OSError:
+        return []
+    newest_first = _transcript_bodies_newest_first_from_blob(blob, limit)
+    if len(newest_first) < limit and read_len < size:
+        try:
+            with open(TRANSCRIPT_LOG_PATH, "rb") as fh:
+                whole = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return newest_first
+        newest_first = _transcript_bodies_newest_first_from_blob(whole, limit)
+    return newest_first
+
+
+def _transcript_bodies_newest_first_from_blob(blob, limit):
+    """Parse transcript_log.md content; return up to ``limit`` bodies newest-first."""
+    if limit <= 0:
         return []
     parts = re.split(r"(?m)^### \d{2}:\d{2}:\d{2}\r?\n", blob)
     newest_first = []
@@ -294,6 +441,19 @@ def load_recent_transcript_texts_from_log(limit=RECENT_TRANSCRIPTIONS_MAX):
             if len(newest_first) >= limit:
                 break
     return newest_first
+
+
+def print_transcript_cli_recent(count):
+    """Write the last ``count`` saved transcript texts to stdout (plain text only)."""
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    texts = load_recent_transcript_texts_from_log(limit=count)
+    for i, block in enumerate(texts):
+        if i:
+            sys.stdout.write("\n")
+        sys.stdout.write(block)
+        if not block.endswith("\n"):
+            sys.stdout.write("\n")
 
 
 def _backup_broken_config_file():
@@ -513,6 +673,45 @@ def restart_linuxflow_service():
         return False
 
 
+def user_service_autostart_enabled():
+    """True if systemd user unit is configured to start at graphical login (~/.config/systemd/user)."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "linuxflow.service"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        state = (result.stdout or "").strip()
+        # enabled, alias, enabled-runtime, etc. treated as yes; static/masked already non-zero RC
+        return bool(state)
+    except Exception:
+        return False
+
+
+def set_user_service_autostart(enable: bool) -> bool:
+    """Enable or disable autostart via systemd user unit (survives reboot / next login session)."""
+    cmd = (
+        ["systemctl", "--user", "enable", "linuxflow.service"]
+        if enable
+        else ["systemctl", "--user", "disable", "linuxflow.service"]
+    )
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def configure_settings_menu():
     """Interactive terminal settings menu for tray-equivalent options."""
     cfg = load_persistent_config()
@@ -525,12 +724,14 @@ def configure_settings_menu():
         print(f"4) Copy to Clipboard   [{'ON' if cfg['clipboard_enabled'] else 'OFF'}]")
         print(f"5) Auto Paste          [{'ON' if cfg['paste_enabled'] else 'OFF'}]")
         print(f"6) Sound Notifications [{'ON' if cfg.get('sound_notifications', False) else 'OFF'}]")
-        print("7) Exit Config")
+        au = user_service_autostart_enabled()
+        print(f"7) Start at Login     [{'ON' if au else 'OFF'}]")
+        print("8) Exit Config")
         print("Choose an item number:")
 
     while True:
         _print_header()
-        choice = _prompt_choice(7)
+        choice = _prompt_choice(8)
         requires_restart = False
 
         if choice == 0:
@@ -640,6 +841,25 @@ def configure_settings_menu():
             else:
                 print("No changes made.")
 
+        elif choice == 6:
+            print("\nStart LinuxFlow automatically at graphical login (systemd user unit):")
+            print("1) ON")
+            print("2) OFF")
+            selected = _prompt_choice(2)
+            enabling = selected == 0
+            if user_service_autostart_enabled() != enabling:
+                if set_user_service_autostart(enabling):
+                    tag = "enabled" if enabling else "disabled"
+                    print(f"Saved: systemd user autostart {tag}.")
+                    if not enabling:
+                        print("(Still running until you quit or restart the unit.)")
+                else:
+                    print("Could not change autostart — run:")
+                    pref = "enable" if enabling else "disable"
+                    print(f"  systemctl --user {pref} linuxflow.service")
+            else:
+                print("No changes made.")
+
         else:
             print("Exiting LinuxFlow configuration.")
             return
@@ -655,20 +875,22 @@ def configure_settings_menu():
 
 def list_devices():
     """Print available audio input devices."""
-    p = pyaudio.PyAudio()
-    print("Audio input devices:")
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info["maxInputChannels"] > 0:
-            marker = " <-- default" if i == p.get_default_input_device_info()["index"] else ""
-            print(f"  [{i}] {info['name']} ({info['maxInputChannels']}ch){marker}")
-    p.terminate()
+    with _suppress_os_stderr():
+        p = pyaudio.PyAudio()
+        print("Audio input devices:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                marker = " <-- default" if i == p.get_default_input_device_info()["index"] else ""
+                print(f"  [{i}] {info['name']} ({info['maxInputChannels']}ch){marker}")
+        p.terminate()
 
 
 def record_audio(device_index=None):
-    """Record audio from microphone until Enter is pressed. Returns float32 numpy array."""
-    p = pyaudio.PyAudio()
-
+    """
+    Record audio from microphone until Enter (stop) or ESC (cancel recording).
+    Returns float32 numpy array, None on error / empty capture, or RECORD_CANCELLED if user pressed ESC while stopping.
+    """
     kwargs = dict(
         format=FORMAT,
         channels=CHANNELS,
@@ -679,35 +901,57 @@ def record_audio(device_index=None):
     if device_index is not None:
         kwargs["input_device_index"] = device_index
 
-    try:
-        stream = p.open(**kwargs)
-    except OSError as e:
-        print(f"  Error opening mic: {e}")
-        p.terminate()
-        return None
-
+    p = None
+    cancelled = False
     frames = []
-    is_recording = True
+    try:
+        # PyAudio() runs Pa_Initialize() and host-API probes (JACK "connect failed" spam) — must be inside suppress.
+        with _suppress_os_stderr():
+            p = pyaudio.PyAudio()
+            stream = p.open(**kwargs)
+            is_recording = True
 
-    def capture():
-        while is_recording:
+            def capture():
+                while is_recording:
+                    try:
+                        data = stream.read(CHUNK, exception_on_overflow=False)
+                        frames.append(data)
+                    except Exception:
+                        break
+
+            thread = threading.Thread(target=capture, daemon=True)
+            thread.start()
+
             try:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
-            except Exception:
-                break
+                tty_prompt_enter_or_esc(
+                    "  Press Enter to stop recording (ESC to discard this clip)...\n",
+                    esc_exits_terminal=False,
+                )
+            except _TTYRecordingCancelled:
+                cancelled = True
+                log_event(logging.INFO, "terminal_recording_cancelled_esc")
+            finally:
+                is_recording = False
+                thread.join(timeout=2)
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+    except OSError as e:
+        log_event(logging.ERROR, "terminal_mic_open_failed", error=str(e))
+        print(f"  Error opening mic: {e}")
+        return None
+    finally:
+        if p is not None:
+            with _suppress_os_stderr():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
 
-    thread = threading.Thread(target=capture, daemon=True)
-    thread.start()
-
-    input("  Press Enter to stop recording...\n")
-
-    is_recording = False
-    thread.join(timeout=2)
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+    if cancelled:
+        return RECORD_CANCELLED
 
     if not frames:
         return None
@@ -727,12 +971,45 @@ def format_for_insert(text, append_space=True):
 
 def copy_to_clipboard(text):
     """Copy text to clipboard (Wayland: wl-copy, fallback: xclip)."""
-    for cmd in [["wl-copy", "--"], ["xclip", "-selection", "clipboard"]]:
+    # Short wl-copy timeout: a wedged compositor/session blocks for seconds and stalls the UI thread.
+    attempts = (
+        (["wl-copy", "--"], 0.85),
+        (["xclip", "-selection", "clipboard"], 2.0),
+    )
+    for cmd, timeout_s in attempts:
         try:
-            subprocess.run(cmd, input=text, text=True, timeout=5, check=True)
+            subprocess.run(
+                cmd,
+                input=text,
+                text=True,
+                timeout=timeout_s,
+                check=True,
+                capture_output=True,
+            )
             return True
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            continue
+        except FileNotFoundError:
+            log_event(logging.DEBUG, "clipboard_backend_missing", cmd=cmd[0])
+        except subprocess.CalledProcessError as e:
+            err = (getattr(e, "stderr", None) or b"") or (getattr(e, "stdout", None) or b"")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            log_event(logging.DEBUG, "clipboard_copy_failed", cmd=cmd[0], stderr=str(err)[:300])
+        except subprocess.TimeoutExpired as e:
+            err_parts = []
+            for attr in ("stderr", "stdout"):
+                chunk = getattr(e, attr, None)
+                if chunk:
+                    err_parts.append(
+                        chunk.decode("utf-8", errors="replace")
+                        if isinstance(chunk, bytes)
+                        else str(chunk)
+                    )
+            log_event(
+                logging.DEBUG,
+                "clipboard_copy_timeout",
+                cmd=cmd[0],
+                snippet=(("; ".join(err_parts))[:300] if err_parts else ""),
+            )
     return False
 
 
@@ -743,11 +1020,16 @@ def type_text(text):
             ["ydotool", "type", "--key-delay", "3", "--", text],
             timeout=30,
             check=True,
+            capture_output=True,
+            text=True,
         )
         return True
     except FileNotFoundError:
+        log_event(logging.DEBUG, "ydotool_type_missing")
         return False
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        err = ((e.stderr or "") + (e.stdout or "")).strip()
+        log_event(logging.DEBUG, "ydotool_type_failed", stderr=err[:400])
         return False
 
 
@@ -759,16 +1041,34 @@ def paste_from_clipboard(text=None):
             ["ydotool", "key", "--key-delay", "3", "29:1", "47:1", "47:0", "29:0"],  # Ctrl+V
             timeout=5,
             check=True,
+            capture_output=True,
+            text=True,
         )
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        log_event(logging.DEBUG, "ydotool_key_missing")
+    except subprocess.CalledProcessError as e:
+        err = ((e.stderr or "") + (e.stdout or "")).strip()
+        log_event(logging.DEBUG, "ydotool_key_failed", stderr=err[:400])
+    except subprocess.TimeoutExpired:
+        log_event(logging.DEBUG, "ydotool_key_timeout")
 
     try:
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=5, check=True)
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            timeout=5,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        log_event(logging.DEBUG, "xdotool_missing")
+    except subprocess.CalledProcessError as e:
+        err = ((e.stderr or "") + (e.stdout or "")).strip()
+        log_event(logging.DEBUG, "xdotool_ctrlv_failed", stderr=err[:400])
+    except subprocess.TimeoutExpired:
+        log_event(logging.DEBUG, "xdotool_ctrlv_timeout")
 
     # Some Wayland sessions block synthetic paste shortcuts.
     # Final fallback: type the transcript directly.
@@ -1389,6 +1689,23 @@ def daemon_mode(args):
         save_settings()
         validate_sound_assets()
 
+    def checked_autostart_login(item):
+        return user_service_autostart_enabled()
+
+    def on_toggle_autostart_login(icon_ref, item):
+        enabling = not user_service_autostart_enabled()
+        if set_user_service_autostart(enabling):
+            notify(
+                "LinuxFlow",
+                "Starts automatically when you log in."
+                if enabling
+                else "Autostart disabled for next login.",
+            )
+            log_event(logging.INFO, "autostart_toggle", enabled=enabling)
+        else:
+            notify("LinuxFlow", "Could not change autostart (systemctl --user failed).")
+        refresh_tray_menu()
+
     def set_model(model_name):
         def _handler(icon_ref, item):
             with settings_lock:
@@ -1638,6 +1955,7 @@ def daemon_mode(args):
                     pystray.MenuItem("Copy to Clipboard", on_toggle_clipboard, checked=checked_setting("clipboard_enabled")),
                     pystray.MenuItem("Auto Paste", on_toggle_paste, checked=checked_setting("paste_enabled")),
                     pystray.MenuItem("Sound Notifications", on_toggle_sound_notifications, checked=checked_setting("sound_notifications")),
+                    pystray.MenuItem("Start at Login", on_toggle_autostart_login, checked=checked_autostart_login),
                 ),
             ),
             pystray.Menu.SEPARATOR,
@@ -1694,7 +2012,7 @@ def daemon_mode(args):
 # ---------- Terminal mode ----------
 
 def terminal_mode(args):
-    """Interactive terminal mode with Enter key to start/stop."""
+    """Interactive terminal mode: Enter start/stop, ESC exits (or discards clip while stopping)."""
     lang = None if args.language == "auto" else args.language
 
     print(f"Loading model '{args.model}'...")
@@ -1709,22 +2027,29 @@ def terminal_mode(args):
         max_retries=args.asr_retries,
     )
     print("Model loaded. Ready.\n")
-    print("=" * 50)
-    print("  LINUXFLOW")
-    print("  Press Enter to START recording")
-    print("  Press Enter again to STOP")
-    print("  Ctrl+C to quit")
-    print("=" * 50)
-    print()
+    print("=" * 56)
+    print("  LINUXFLOW — terminal mode")
+    print("  Press Enter to start recording  ·  ESC to exit")
+    print("  While recording: Enter to finish  ·  ESC discards clip")
+    print("=" * 56)
+    print("(PortAudio probe noise, ydotool, etc. goes to ~/.local/state/linuxflow/linuxflow.log)\n")
 
     session_count = 0
 
     try:
         while True:
-            input("Press Enter to start recording...")
-            print("  Recording... (speak now)")
+            try:
+                tty_prompt_enter_or_esc("Press Enter to start recording (ESC to exit)...\n")
+            except _TTYEscExit:
+                break
+
+            print("  Recording… (speak now)")
 
             audio = record_audio(device_index=args.device)
+
+            if audio is RECORD_CANCELLED:
+                print("  Clip discarded.\n")
+                continue
 
             if audio is None or len(audio) < SAMPLE_RATE * MIN_DURATION:
                 print("  Too short, skipping.\n")
@@ -1776,13 +2101,27 @@ def terminal_mode(args):
                         if paste_from_clipboard(text=insert_text):
                             print("  [paste] done")
                         else:
-                            print("  [paste] failed (ensure ydotoold is running)")
+                            log_event(
+                                logging.WARNING,
+                                "terminal_paste_fallback_failed",
+                                hint="See log for ydotool/xdotool stderr; enable ydotoold or install xdotool if needed.",
+                            )
+                else:
+                    log_event(
+                        logging.WARNING,
+                        "terminal_clipboard_copy_failed",
+                        hint="wl-copy/xclip unavailable or timed out; use --no-clipboard or fix Wayland clipboard.",
+                    )
 
             print()
 
     except KeyboardInterrupt:
-        print(f"\n\nDone. {session_count} transcriptions this session.")
+        log_event(logging.INFO, "terminal_keyboard_interrupt")
+        print("\n  Ctrl+C handled — shutting down cleanly.")
+    except EOFError:
+        log_event(logging.INFO, "terminal_eof")
     finally:
+        print(f"\nDone. {session_count} transcriptions this session.")
         try:
             asr_backend.close()
         except Exception as e:
@@ -1824,6 +2163,13 @@ def main():
         action="store_true",
         help=f"Open the transcript history file ({TRANSCRIPT_LOG_PATH}) in the default viewer and exit",
     )
+    parser.add_argument(
+        "--transcript",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Print the last N saved transcripts to stdout (body text only) and exit",
+    )
     args = parser.parse_args()
     args._provided_flags = {
         token.split("=")[0]
@@ -1841,6 +2187,14 @@ def main():
 
     if args.open_transcript_log:
         open_transcript_log_viewer()
+        sys.exit(0)
+
+    if args.transcript is not None:
+        if args.transcript < 1:
+            parser.error("--transcript N requires N >= 1")
+        if args.daemon:
+            parser.error("--transcript cannot be combined with --daemon")
+        print_transcript_cli_recent(args.transcript)
         sys.exit(0)
 
     if args.daemon:

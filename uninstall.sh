@@ -4,6 +4,8 @@ set -euo pipefail
 APP_DIR="${HOME}/.local/share/linuxflow"
 SERVICE_PATH="${HOME}/.config/systemd/user/linuxflow.service"
 DESKTOP_PATH="${HOME}/.local/share/applications/linuxflow.desktop"
+CLI_LAUNCHER_PATH="${HOME}/.local/bin/linuxflow"
+FISH_PATH_DROPIN="${HOME}/.config/fish/conf.d/linuxflow-path.fish"
 UDEV_RULE_PATH="/etc/udev/rules.d/70-linuxflow-input.rules"
 
 run_sudo() {
@@ -26,6 +28,8 @@ fi
 
 rm -f "$SERVICE_PATH"
 rm -f "$DESKTOP_PATH"
+rm -f "$CLI_LAUNCHER_PATH"
+rm -f "$FISH_PATH_DROPIN"
 rm -rf "$APP_DIR"
 
 if [[ -f "$UDEV_RULE_PATH" ]]; then
